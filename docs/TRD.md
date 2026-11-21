@@ -2,500 +2,518 @@
 
 | | |
 |---|---|
-| **Status** | Draft v0.1 — design only, no code written yet |
-| **Companion** | [DESIGN.md](../DESIGN.md) (PRD: business rules `BR-*`, requirements `FR-*`/`NFR-*`, open questions `Q-*`) |
+| **Status** | Draft **v0.2** — revised after review. Design only; no code yet. |
+| **Companion** | [DESIGN.md](../DESIGN.md) (PRD: rules `BR-*`, requirements `FR-*`, review response §0) · [README.md](../README.md) (the API contract with curl examples) |
 
-This document says *how* we make the three guarantees true:
+This document says *how* we make three guarantees true:
 
 - **G1** a court is never double-booked, however many requests arrive at once
 - **G2** a client retrying a timed-out confirm never ends up with two bookings
 - **G3** a failed multi-step operation leaves no partial state
 
-**Design principle:** every guarantee is enforced by **Postgres** (constraints, row locks, transactions), not by Python code, locks or caches. Application code is allowed to be wrong and concurrent; the database refuses to store a bad state. That is what makes the guarantees hold with several API instances (NFR-2) and what makes them provable by test.
+## 1. Principle (restated after review)
 
----
+> **Invariants are enforced by Postgres. Time comes from Postgres. Policy numbers live in code.**
 
-## 1. Architecture
+| Layer | What it owns | Examples |
+|---|---|---|
+| **Postgres: invariants** | Things that must be true no matter which code, instance or person writes | no overlapping active bookings (exclusion constraint); at most one charge and one refund per booking (unique index); expired holds stop blocking (trigger); all-or-nothing (transactions) |
+| **Postgres: the clock** | The single definition of "now" | `clock_timestamp()` — never an application-supplied time (BR-22) |
+| **Application code: policy** | Numbers and rules that a client may change | 24 h refund window, 3-booking cap, 5 min TTL, price lookup, 90-day horizon |
 
-```
-          ┌────────────┐   HTTP    ┌────────────────────┐        ┌──────────────┐
- client ─▶│  gateway   │──────────▶│  api (FastAPI) ×N  │───────▶│              │
- (auth)   │ (upstream) │ X-Member- │  stateless         │  SQL   │ Postgres 15  │
-          └────────────┘   Id      └────────────────────┘        │  (source of  │
-                                    ┌────────────────────┐        │   truth)     │
-                                    │ worker ×1+         │───────▶│              │
-                                    │ expiry sweeper,    │        └──────────────┘
-                                    │ key purge          │
-                                    └────────────────────┘
-```
+The v0.1 wording "the database enforces everything" was too strong: the 24 h threshold and the cap are policy and stay in Python. What must **not** be in Python is anything whose failure produces a double-booking or a duplicate charge, and the **clock** those rules are judged against. v0.1 used an app clock; with two API instances whose clocks differ by 2 s, one instance would evict a hold the other still considers live. Now there is one clock.
 
-- **api** — stateless FastAPI processes. Any number can run.
-- **worker** — one small process that tidies up (marks expired holds, purges old idempotency keys). **Nothing depends on it for correctness** (§6.2). Safe to run several (`SKIP LOCKED`).
-- **db** — Postgres 15 with the `btree_gist` extension.
-- `migrate` — one-shot compose service running `alembic upgrade head` (+ seed in dev) before api/worker start.
-
-Layering inside the api (dependencies point downward only):
+## 2. Architecture
 
 ```
-api/       routers, request/response schemas, error handlers, identity dependencies
-services/  use-cases: one function = one DB transaction (hold, confirm, cancel, recurring, availability, utilization)
-domain/    pure functions, no I/O: slots, pricing, refund policy, quota policy, week maths
-db/        SQLAlchemy models, session/unit-of-work, retry helper
+ client ─▶ gateway (auth, upstream) ─▶ api (FastAPI) ×N  ─▶  Postgres 15  (source of truth + clock)
+              X-Member-Id / X-Staff-Key   stateless
 ```
 
-`domain/` being pure is deliberate: the money-and-time rules (refund boundary, DST, peak windows) are unit-testable without a database.
+- **api** — stateless FastAPI processes; any number can run.
+- **db** — Postgres 15 with `btree_gist`.
+- **migrate** — one-shot compose service: `alembic upgrade head`, then idempotent seed.
+- **No worker in v1** (cut). Nothing in the system depends on a background job. See §9.
 
-## 2. Stack & tooling
+Layers (dependencies point down only):
+
+```
+api/       routers, schemas, error handlers, identity (deps.py — the ONLY place headers are read)
+services/  use-cases: one function = one DB transaction
+domain/    pure functions, no I/O: slots, pricing, refund, weeks
+db/        models, session/unit-of-work, retry helper
+```
+
+`domain/` is pure on purpose: refund boundary, DST, and peak windows are unit-tested without a database.
+
+## 3. Stack & tooling
 
 | Concern | Choice |
 |---|---|
-| Language / runtime | Python 3.11 |
-| Web | FastAPI + Uvicorn, **sync** endpoints (run in Starlette's threadpool) |
-| ORM / driver | SQLAlchemy 2.0 (typed `Mapped[]` models, 2.0 style) + **psycopg 3** |
-| Migrations | Alembic; migrations are hand-reviewed, including raw DDL for the exclusion constraint |
-| DB | Postgres 15 (`postgres:15` image; `btree_gist` is in contrib) |
-| Settings | `pydantic-settings` (env vars) |
-| Tests | pytest, pytest-xdist off for concurrency tests, `httpx` + FastAPI `TestClient`, real Postgres (compose service locally; service container in CI) |
-| Lint / format | `ruff check` + `ruff format --check` |
-| Types | `mypy --strict` |
+| Language | Python 3.11 |
+| Web | FastAPI + Uvicorn, **sync** endpoints (threadpool) |
+| ORM / driver | SQLAlchemy 2.0 (typed `Mapped[]`) + psycopg 3 |
+| Migrations | Alembic, hand-reviewed; raw DDL for constraint, trigger, view |
+| DB | `postgres:15` |
+| Settings | pydantic-settings (env) |
+| Tests | pytest + httpx/TestClient against **real Postgres** |
+| Lint/format/types | `ruff check`, `ruff format --check`, `mypy --strict` |
 | Packaging | `pyproject.toml` + `uv` (lockfile committed) |
-| Suppressions | **None.** No `# noqa`, `# type: ignore`, `# pyright:`, `# fmt:`. CI greps for them and fails. Rule selection lives in `pyproject.toml` (config, not inline), and we do not use `per-file-ignores` to hide real findings. |
+| Suppressions | **None** (`# noqa`, `# type: ignore`, …). A test and a CI step grep for them. |
 
-Why sync, not async: the work is DB-bound; async adds a second concurrency model (and mypy/typing friction with async SQLAlchemy) while the guarantees come from the DB anyway. Pool sizing is explicit (§11).
+Sync rather than async: the work is DB-bound, the guarantees come from the DB, and sync keeps transactions and mypy typing simple.
 
-## 3. Repository layout (planned)
+## 4. Repository layout (planned)
 
 ```
 .
-├── README.md  DESIGN.md  LIMITATIONS.md (later)
-├── docs/TRD.md
-├── docker-compose.yml  Dockerfile
-├── pyproject.toml  uv.lock  alembic.ini
-├── alembic/versions/…
+├── README.md  DESIGN.md  LIMITATIONS.md (later)  docs/TRD.md
+├── docker-compose.yml  Dockerfile  pyproject.toml  uv.lock  alembic.ini
+├── alembic/versions/
+├── scripts/readme_check.py          # runs the README's curl blocks (CI)
 ├── src/courtlock/
-│   ├── main.py  config.py  clock.py
-│   ├── api/        (routers/, schemas.py, errors.py, deps.py)
-│   ├── services/   (holds.py, bookings.py, recurring.py, availability.py, utilization.py, idempotency.py)
-│   ├── domain/     (slots.py, pricing.py, refund.py, quota.py, weeks.py)
-│   ├── db/         (models.py, session.py, uow.py, retry.py)
-│   ├── worker.py   seed.py
-├── tests/
-│   ├── unit/  integration/  concurrency/  atomicity/  contract/
+│   ├── main.py  config.py  seed.py
+│   ├── api/       routers/, schemas.py, errors.py, deps.py
+│   ├── services/  holds.py, bookings.py, recurring.py, availability.py, utilization.py
+│   ├── domain/    slots.py, pricing.py, refund.py, weeks.py
+│   └── db/        models.py, session.py, retry.py
+├── tests/  unit/  integration/  concurrency/  atomicity/  contract/
 └── .github/workflows/ci.yml
 ```
 
-## 4. Data model
+## 5. Data model
 
-All ids are UUID (generated app-side). All timestamps are `timestamptz` (UTC). Money is `integer` minor units.
+All ids UUID (app-generated). Timestamps `timestamptz` (UTC). Money `integer` minor units.
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS btree_gist;
-
 CREATE TYPE booking_status AS ENUM ('HELD','CONFIRMED','CANCELLED','EXPIRED');
 CREATE TYPE price_band     AS ENUM ('PEAK','OFFPEAK');
 
-venues(
-  id uuid PK, name text NOT NULL,
-  timezone text NOT NULL,                       -- IANA, e.g. 'Asia/Kolkata'
-  opens_at time NOT NULL, closes_at time NOT NULL,   -- local; CHECK opens_at < closes_at
-  peak_price_cents int NOT NULL CHECK (>= 0),
-  offpeak_price_cents int NOT NULL CHECK (>= 0),
-  currency char(3) NOT NULL )
+venues(id PK, name, timezone text,             -- IANA
+       opens_at time, closes_at time,          -- local; CHECK opens_at < closes_at
+       peak_price_cents int, offpeak_price_cents int, currency char(3))
 
-peak_windows(
-  id uuid PK, venue_id uuid FK,
-  weekday smallint CHECK (0..6),                -- 0 = Monday, venue-local
-  start_time time, end_time time CHECK (start_time < end_time) )
+peak_windows(id PK, venue_id FK, weekday smallint CHECK 0..6,   -- 0 = Monday, venue-local
+             start_time time, end_time time, CHECK start_time < end_time)
 
-courts(
-  id uuid PK, venue_id uuid FK, name text, sport text,
-  is_active bool NOT NULL DEFAULT true, UNIQUE (venue_id, name) )
+courts(id PK, venue_id FK, name, sport, is_active bool DEFAULT true, UNIQUE(venue_id,name))
 
-members( id uuid PK, name text NOT NULL, email text NOT NULL UNIQUE )
+members(id PK, name, email UNIQUE)
 
-recurring_series(
-  id uuid PK, member_id FK, court_id FK,
-  weekday smallint, local_start_time time, occurrences smallint CHECK (2..12),
-  created_at timestamptz )
+recurring_series(id PK, member_id FK, court_id FK, weeks smallint CHECK 2..12, created_at)
 
-bookings(                                       -- a HOLD is a booking in status HELD
-  id uuid PK,                                   -- the hold id IS the booking id
-  member_id uuid FK NOT NULL, court_id uuid FK NOT NULL,
-  series_id uuid FK NULL,
-  start_at timestamptz NOT NULL, end_at timestamptz NOT NULL,
+bookings(                                    -- a HOLD is a booking in status HELD; hold id == booking id
+  id PK, member_id FK, court_id FK, series_id FK NULL,
+  start_at timestamptz, end_at timestamptz,
   during tstzrange GENERATED ALWAYS AS (tstzrange(start_at, end_at, '[)')) STORED,
-  status booking_status NOT NULL,
-  band price_band NOT NULL, price_cents int NOT NULL CHECK (>= 0), currency char(3) NOT NULL,
-  hold_expires_at timestamptz NULL,             -- required while HELD
+  status booking_status, band price_band, price_cents int CHECK >= 0, currency char(3),
+  hold_expires_at timestamptz NULL,          -- required while HELD
   confirmed_at timestamptz NULL, cancelled_at timestamptz NULL,
-  refund_cents int NULL,                        -- set exactly once, at cancel
-  created_at timestamptz NOT NULL,
+  refund_percent smallint NULL CHECK 0..100, refund_cents int NULL,   -- set once, at cancel
+  created_at timestamptz,
   CHECK (end_at = start_at + interval '1 hour'),
-  CHECK (status <> 'HELD' OR hold_expires_at IS NOT NULL),
-  CHECK (status <> 'CONFIRMED' OR confirmed_at IS NOT NULL),
-  CHECK (status <> 'CANCELLED' OR (cancelled_at IS NOT NULL AND refund_cents IS NOT NULL)),
+  CHECK (status <> 'HELD'      OR hold_expires_at IS NOT NULL),
+  CHECK (status <> 'CONFIRMED' OR confirmed_at   IS NOT NULL),
+  CHECK (status <> 'CANCELLED' OR (cancelled_at IS NOT NULL AND refund_percent IS NOT NULL AND refund_cents IS NOT NULL)),
 
-  -- ★ THE double-booking guarantee (G1) ★
-  EXCLUDE USING gist (court_id WITH =, during WITH &&)
-          WHERE (status IN ('HELD','CONFIRMED')) )
+  -- ★ G1: the double-booking guarantee ★
+  EXCLUDE USING gist (court_id WITH =, during WITH &&) WHERE (status IN ('HELD','CONFIRMED')))
 
-CREATE INDEX bookings_member_active_idx ON bookings (member_id, start_at)
-        WHERE status IN ('HELD','CONFIRMED');
-CREATE INDEX bookings_held_expiry_idx   ON bookings (hold_expires_at) WHERE status = 'HELD';
+ledger_entries(id PK, booking_id FK, member_id FK, kind text CHECK IN ('CHARGE','REFUND'),
+               amount_cents int CHECK > 0, currency, created_at,
+               UNIQUE(booking_id, kind))     -- ★ G2: at most one charge and one refund per booking ★
+```
+
+### 5.1 Expiry trigger — makes BR-6 true for every writer
+
+The exclusion constraint cannot reference `now()` (index predicates must be immutable), so a `HELD` row that has timed out would still block. Instead of teaching each code path to evict stale holds (our v0.1 mistake), the **table** does it:
+
+```sql
+CREATE FUNCTION evict_expired_holds() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.status IN ('HELD','CONFIRMED') THEN
+    UPDATE bookings
+       SET status = 'EXPIRED'
+     WHERE court_id = NEW.court_id
+       AND during && tstzrange(NEW.start_at, NEW.end_at, '[)')   -- NEW.during is not computed yet in a BEFORE trigger
+       AND status = 'HELD'
+       AND hold_expires_at <= clock_timestamp();
+  END IF;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER bookings_evict_expired
+  BEFORE INSERT ON bookings FOR EACH ROW EXECUTE FUNCTION evict_expired_holds();
+```
+
+A `BEFORE INSERT` trigger runs *before* the exclusion constraint is checked, in the same transaction, so a freed slot is insertable. Any insert — hold, recurring, a future maintenance block, a hand-typed `psql` statement — gets this behaviour; no code path can forget it.
+
+### 5.2 The single definition of "live" — BR-23
+
+```sql
+CREATE VIEW live_bookings AS
+SELECT * FROM bookings
+ WHERE status = 'CONFIRMED'
+    OR (status = 'HELD' AND hold_expires_at > clock_timestamp());
+```
+
+Availability, the member cap, the hold-replay lookup and the series pre-check — every read that asks "what blocks a slot / what counts toward the cap" — go through `live_bookings`, so there is no second definition to get wrong. (State transitions — confirm, cancel — necessarily address one row by id and spell out their own `status`/`hold_expires_at` conditions in the `UPDATE`; those are covered by the G2 tests.)
+
+### 5.3 Indexes
+
+```sql
+CREATE INDEX bookings_member_future_idx ON bookings (member_id, start_at) WHERE status IN ('HELD','CONFIRMED');
 CREATE INDEX bookings_court_time_idx    ON bookings (court_id, start_at);
-
-ledger_entries(                                 -- append-only money log
-  id uuid PK, booking_id uuid FK NOT NULL, member_id uuid FK NOT NULL,
-  kind text CHECK (kind IN ('CHARGE','REFUND')),
-  amount_cents int NOT NULL CHECK (> 0), currency char(3), created_at timestamptz,
-  UNIQUE (booking_id, kind) )                   -- ★ at most one charge and one refund per booking (G2) ★
-
-idempotency_keys(
-  member_id uuid, key text, endpoint text, request_hash text,
-  status_code smallint, response_body jsonb, created_at timestamptz,
-  PRIMARY KEY (member_id, key) )
 ```
 
-Why this shape:
+### 5.4 Why this shape
 
-- **One `bookings` table for holds and bookings.** Confirm is a state change on one row. There is no moment where the slot is "released by the hold and not yet taken by the booking" — the classic double-booking window of two-table designs.
-- **`EXCLUDE … WHERE status IN ('HELD','CONFIRMED')`** — two active rows for the same court with overlapping time ranges cannot exist. `CANCELLED`/`EXPIRED` rows drop out of the constraint, which is how a slot is freed. The constraint also covers future multi-hour bookings (Q-4) with no change.
-- **The constraint cannot mention `now()`** (index predicates must be immutable). That is why expiry needs the explicit step in §6.2.
-- **`UNIQUE (booking_id, kind)` on the ledger** makes a double charge or double refund *structurally impossible*, even if application logic were wrong.
-- Slot alignment (start on the hour in *venue* local time) is validated in `domain/slots.py`, not in SQL, because it depends on the venue's time zone (including half-hour-offset zones like IST).
-
-## 5. API specification
-
-Conventions: JSON, `snake_case`, timestamps are ISO-8601 with offset (responses always UTC `Z`). No path version prefix (the contract paths are fixed). Errors are `application/problem+json` (§8).
-
-**Identity (decision D-02; Q-9):**
-`X-Member-Id: <uuid>` on member endpoints; `X-Staff-Key: <secret>` on `/staff/*` (constant-time compare against `STAFF_API_KEY`). Missing/unknown → 401 / 404 as listed in §8. All of this lives in `api/deps.py`, so changing the identity scheme touches one file.
-
-### 5.1 `POST /holds`
-
-Headers: `X-Member-Id` (required), `Idempotency-Key` (optional, FR-12).
-
-```json
-{ "court_id": "uuid", "start_at": "2026-11-20T18:00:00+05:30" }
-```
-
-`201 Created`
-
-```json
-{ "id": "uuid", "court_id": "uuid", "member_id": "uuid",
-  "start_at": "2026-11-20T12:30:00Z", "end_at": "2026-11-20T13:30:00Z",
-  "status": "HELD", "price_band": "PEAK", "price_cents": 1200, "currency": "INR",
-  "expires_at": "2026-11-09T10:05:00Z" }
-```
-
-Errors: `422 invalid_slot` (not on the hour in venue time / outside opening hours / in the past / beyond horizon), `404 court_not_found`, `409 slot_unavailable`, `409 booking_limit_reached`.
-
-### 5.2 `POST /holds/{id}/confirm`
-
-No body. Headers: `X-Member-Id`.
-
-`200 OK` — first call **and** every replay:
-
-```json
-{ "id": "<same id as the hold>", "status": "CONFIRMED", "confirmed_at": "…",
-  "court_id": "…", "start_at": "…", "end_at": "…",
-  "price_band": "PEAK", "price_cents": 1200, "currency": "INR" }
-```
-
-Replay adds response header `Idempotent-Replay: true`. Errors: `404 hold_not_found` (also for another member's hold — no id probing), `409 hold_expired`, `409 invalid_state` (cancelled/…), `409 slot_started`.
-
-### 5.3 `POST /bookings/{id}/cancel`
-
-No body. Headers: `X-Member-Id`.
-
-`200 OK`
-
-```json
-{ "id": "…", "status": "CANCELLED", "cancelled_at": "…",
-  "refund_cents": 1200, "refund_percent": 100, "currency": "INR" }
-```
-
-`refund_percent` is `100` if `start_at − now ≥ 24h` else `0`. Replay returns the **stored** values (same `cancelled_at`, same refund). Errors: `404 booking_not_found`, `409 booking_started`, `409 invalid_state` (still a HELD hold → use `DELETE /holds/{id}`; EXPIRED).
-
-### 5.4 `GET /courts/{id}/availability?from=2026-11-20&to=2026-11-22`
-
-`from`/`to` are **venue-local dates**, `to` exclusive, default `to = from + 1 day`, max span 14 days, `from` defaults to today.
-
-```json
-{ "court_id": "…", "timezone": "Asia/Kolkata",
-  "slots": [
-    { "start_at": "2026-11-20T00:30:00Z", "end_at": "2026-11-20T01:30:00Z",
-      "status": "AVAILABLE", "price_band": "OFFPEAK", "price_cents": 600, "currency": "INR" },
-    { "start_at": "…", "status": "HELD", "…": "…" },
-    { "start_at": "…", "status": "BOOKED", "…": "…" } ] }
-```
-
-Slots already started are omitted. Expired holds are reported `AVAILABLE` (the read applies the same predicate as §6.2). No member identity is exposed (BR-20).
-
-### 5.5 Other endpoints (design in brief)
-
-| Endpoint | Notes |
-|---|---|
-| `POST /recurring-bookings` | `{court_id, weekday, local_start_time, weeks}` (or first `start_at` + `weeks`). `201` with the series and its bookings, or `409` listing **every** conflicting occurrence date (`conflicts: [...]`) and nothing is written. |
-| `POST /recurring-bookings/{id}/cancel` | Cancels all future occurrences in one transaction. |
-| `DELETE /holds/{id}` | Owner releases an unexpired hold → status `CANCELLED`, refund 0, no ledger entries. |
-| `GET /me/bookings?status=…` | Own rows only. |
-| `GET /venues`, `GET /venues/{id}/courts` | Public browse. |
-| `GET /staff/utilization?week=2026-W47&venue_id=` | §7.4. |
-| `GET /healthz`, `GET /readyz` | Liveness / DB-reachable. |
+- **One `bookings` table for holds and bookings.** Confirm is a state change on one row; there is no window between "hold released" and "booking created". The hold id *is* the booking id.
+- **Slot alignment is app-validated**, not SQL: it depends on the venue zone (incl. half-hour offsets such as IST).
+- **Zero-price bookings** write no ledger row (`amount_cents > 0`).
 
 ## 6. Concurrency & correctness design
 
 ### 6.1 G1 — never double-booked
 
-The only way to create an active row is `INSERT INTO bookings (…status 'HELD'…)` (holds) or the batch insert (recurring). Both go through the exclusion constraint.
+Every active row is created by an `INSERT` into `bookings` (hold, or recurring). All inserts pass the exclusion constraint.
 
-- Two transactions inserting overlapping ranges on one court: the second **blocks** on the first's uncommitted row; if the first commits, the second fails with SQLSTATE `23P01` (`exclusion_violation`), which we map to `409 slot_unavailable`; if the first rolls back, the second succeeds. This is true at the default `READ COMMITTED` isolation.
-- Application does **not** check-then-insert as its defence. (We may run a cheap pre-check to return nicer errors, but the constraint is the authority.)
-- Even code that bypasses the API (a rogue script, a future endpoint, a bug) cannot violate G1.
+- Two transactions inserting overlapping ranges for one court: the second **blocks** on the first's uncommitted row; if the first commits, the second fails with SQLSTATE `23P01` → we return `409 slot_unavailable`; if the first rolls back, the second succeeds. True at `READ COMMITTED`.
+- The application does not rely on check-then-insert (a cheap pre-check may give nicer errors; the constraint is the authority).
+- Code that bypasses the API cannot violate G1.
 
-**Proof by test:** §10 — N concurrent HTTP requests + a direct-SQL attack on the constraint + a randomized property test comparing against a model.
+### 6.2 Holds never block forever — and the recurring walk-through
 
-### 6.2 Holds that never block forever (BR-6)
+**The scenario the review asked about.** Member A holds Saturday 10:00 on court 1 at week 2 of a series that Member B now wants to book weekly. A's hold timed out 10 minutes ago. The sweeper does not exist; the row is still `status='HELD'`.
 
-The constraint treats `HELD` as blocking, but `now()` cannot be in an index predicate. So expiry is done in **the same transaction as every hold insert**, before the insert:
+*v0.1 trace (broken):*
+1. `POST /recurring-bookings` begins; inserts occurrence 1 (fine), occurrence 2.
+2. Occurrence 2's INSERT collides with A's stale `HELD` row → `23P01` → `409 series_conflict`.
+3. B is told a free slot is taken; A's dead hold blocks B **forever** (no sweeper). BR-6 is violated. The eviction `UPDATE` existed only in `create_hold()`.
+
+*v0.2 trace (correct):*
+1. `POST /recurring-bookings` begins one transaction; locks B's `members` row; reads `now = clock_timestamp()`.
+2. **Pre-check** reads `live_bookings` for the N target slots. A's row is not live (`hold_expires_at <= clock_timestamp()`), so it is **not** reported as a conflict.
+3. Inserts occurrences in ascending order. Before each insert the `BEFORE INSERT` trigger runs and sets A's stale row to `EXPIRED`. The exclusion constraint is then checked and passes.
+4. N ledger charges; `COMMIT`. B has the full series; A's row is `EXPIRED`.
+
+*Variants:*
+
+| Situation | Outcome |
+|---|---|
+| Stale hold on week 2, **live** hold on week 4 | Pre-check reports exactly week 4 → `409 series_conflict`, `conflicts:[week 4]`. Rollback: nothing written; A's stale hold is untouched (still `HELD`, still expired). |
+| Stale hold raced by a concurrent single hold | Both transactions try to evict the same stale row; one waits on the row lock, re-reads after the other commits. Exactly one insert wins the constraint; the other gets `409`. |
+| Raw `psql` `INSERT` over a stale hold | Succeeds (trigger). Over a live hold: `23P01`. |
+| A confirms the hold at the last instant | Confirm's conditional `UPDATE` (§6.3) takes the row lock first; the trigger's eviction then re-evaluates `status='HELD'` after the lock is released, finds `CONFIRMED`, evicts nothing; the INSERT fails the constraint → `409`. |
+
+### 6.3 G2 — retries
+
+**Confirm** is a single conditional `UPDATE` plus a classification read; no application-level decision between them:
 
 ```sql
--- in create_hold(), same transaction, before INSERT
-UPDATE bookings SET status = 'EXPIRED'
- WHERE court_id = :court AND during && :slot AND status = 'HELD' AND hold_expires_at <= :now;
-INSERT INTO bookings (...) VALUES (...);          -- may now succeed because the stale hold is no longer HELD
-```
-
-- Correctness does **not** depend on the worker. If the worker is dead for a week, an expired hold still cannot block anyone: the next person who wants that slot evicts it as part of their own transaction.
-- The same predicate (`status='HELD' AND hold_expires_at > now`) is used when reading availability and when counting a member's cap, so those reads treat expired holds as free without writing.
-- The worker's sweep (`UPDATE … SET status='EXPIRED' WHERE status='HELD' AND hold_expires_at <= now`, in batches with `FOR UPDATE SKIP LOCKED`) is housekeeping so that rows reach a terminal state and reports are tidy.
-
-Races (all resolved by row locks, READ COMMITTED re-evaluation):
-
-| Race | Outcome |
-|---|---|
-| confirm(H) vs. new hold for same slot evicting H, H expired | whichever locks row H first; if eviction wins, confirm sees `EXPIRED` → `hold_expired`; if confirm runs first it also sees `now ≥ expires` → `hold_expired`. Never both succeed. |
-| confirm(H) just **before** expiry vs. new hold | confirm locks H, sets `CONFIRMED`. The evicting `UPDATE` re-checks its `WHERE` after the lock is released, no longer matches, evicts nothing; the INSERT then fails the constraint → `slot_unavailable`. |
-
-### 6.3 G2 — retried confirm (and cancel, and hold)
-
-**Confirm** is idempotent *by construction*: it is a state transition on one row identified by the hold id.
-
-```
 BEGIN;
-SELECT * FROM bookings WHERE id=:id AND member_id=:me FOR UPDATE;   -- serialises concurrent confirms
-  not found                 → 404
-  status = CONFIRMED        → return it (replay)        -- no new charge
-  status = HELD, now ≥ exp  → mark EXPIRED, 409 hold_expired   (committed)
-  status = HELD, now < exp  → UPDATE status=CONFIRMED, confirmed_at=:now
-                              INSERT ledger_entries(CHARGE, price_cents)     -- UNIQUE(booking_id,kind)
-  else                      → 409 invalid_state
+UPDATE bookings
+   SET status = 'CONFIRMED', confirmed_at = clock_timestamp()
+ WHERE id = :id AND member_id = :me
+   AND status = 'HELD' AND hold_expires_at > clock_timestamp()
+RETURNING *;
+-- 1 row  → INSERT ledger_entries(CHARGE, price_cents) [if price > 0]; return 200
+-- 0 rows → SELECT status, hold_expires_at … WHERE id=:id AND member_id=:me :
+--            no row                  → 404 hold_not_found           (also for someone else's hold)
+--            CONFIRMED               → 200, same body, header Idempotent-Replay: true   (the retry case)
+--            HELD past expiry / EXPIRED → 409 hold_expired
+--            CANCELLED               → 409 invalid_state
 COMMIT;
 ```
 
-A client that times out and retries while the first attempt is still running simply queues on the row lock, then sees `CONFIRMED` and gets the same body. No second booking exists because there is only one row; no second charge can exist because of the unique index.
+A retry that arrives while the first attempt is still running blocks on the row lock inside `UPDATE`, then (READ COMMITTED re-evaluates `WHERE`) matches 0 rows, sees `CONFIRMED`, and replays. No second row exists; `UNIQUE(booking_id,'CHARGE')` is the structural backstop. The expired branch **writes nothing**, so there is no error path that needs to commit.
 
-Note one subtlety: the "expired" branch writes `EXPIRED` and must commit, so that error path is deliberately *not* rolled back; it is a single-row, self-consistent state change.
+**Cancel** locks the row, then decides:
 
-**Cancel** uses the same pattern (`FOR UPDATE`; `CANCELLED` → return stored refund; else compute refund, write `refund_cents`, insert `REFUND` ledger row if `> 0`).
+```sql
+BEGIN;
+SELECT * FROM bookings WHERE id=:id AND member_id=:me FOR UPDATE;
+now := clock_timestamp()                                  -- read after the lock
+  none                          → 404 booking_not_found
+  CANCELLED                     → 200, stored cancelled_at / refund (replay; no new ledger row)
+  HELD live (hold_expires_at>now) → release: status=CANCELLED, refund_percent=0, refund_cents=0
+  HELD past expiry / EXPIRED    → 409 hold_expired
+  CONFIRMED, start_at <= now    → 409 booking_started
+  CONFIRMED                     → percent = refund_percent(start_at, now)   -- 100 if start_at-now >= 24h else 0
+                                  UPDATE … status=CANCELLED, cancelled_at=now, refund_percent, refund_cents
+                                  INSERT ledger REFUND [if refund_cents > 0]
+COMMIT;
+```
 
-**Hold creation** is the one call that is not naturally idempotent: if the response to `POST /holds` is lost, the retry hits the member's own hold on that slot and gets a confusing `409 slot_unavailable`, even though the first attempt succeeded. `Idempotency-Key` closes that gap: inside the same transaction we `INSERT INTO idempotency_keys … ON CONFLICT DO NOTHING`. If we inserted, we proceed and store the response before commit. If it already exists (even uncommitted — Postgres waits for the other transaction), we return the stored response. A mismatched `request_hash` returns `422 idempotency_key_reuse`. Because the key row is in the same transaction as the work, a failed attempt stores nothing and may be retried freely.
+**Hold retry** (`POST /holds` whose response was lost): after locking the member row, we look in `live_bookings` for *this member's* `HELD` row for the same court and start. If found, return it with `200` (new holds are `201`). No `Idempotency-Key` table is needed (cut).
 
 ### 6.4 G3 — no partial state
 
-- **One use-case = one DB transaction** (`with uow:`). Nothing is committed until the function returns; any exception → rollback of *everything* (booking rows, ledger rows, idempotency key).
-- **No external side effects inside a transaction.** v1 has none: payments are ledger rows (D-07), no emails, no HTTP calls. If we ever add them, they go through a transactional outbox (§12).
-- Multi-step operations and their atomic units:
+- **One use-case = one transaction.** Nothing commits until the function returns; any exception rolls back everything (booking rows, ledger rows, series row).
+- **No external side effects inside a transaction.** v1 has none (ledger rows, not a gateway; no email/HTTP). If added, use an outbox (§17).
 
-| Operation | Steps in the one transaction |
+| Operation | Atomic unit |
 |---|---|
-| confirm | status → CONFIRMED, charge ledger row |
-| cancel | status → CANCELLED, refund amount, refund ledger row |
-| recurring create | series row, N booking rows, N charge rows, idempotency key |
-| recurring cancel | N cancellations, ≤ N refund rows |
-| create hold | evict expired, quota check, insert, idempotency key |
+| create hold | member lock, replay check, cap check, insert (+ trigger eviction) |
+| confirm | status → CONFIRMED, charge row |
+| cancel | status → CANCELLED + refund fields, refund row |
+| recurring create | series row, N booking rows (+ evictions), N charge rows |
+| series cancel (should) | N cancellations, ≤ N refund rows |
 
-- **Proof by fault injection:** services call `faults.checkpoint("after_status_update")` at named points. Production wiring is a no-op object; tests inject one that raises at a chosen point. For every operation × every checkpoint the test asserts that a full snapshot of all tables is **identical** before and after. This avoids inline test hooks in production code paths (no `if TESTING`).
+**Proof — failure injection with no hooks in production code.** Tests install a *temporary DB trigger* that raises on a chosen statement (e.g. "fail on the 2nd INSERT into `ledger_entries`", "fail the UPDATE of `bookings` to CANCELLED", "fail on the 3rd INSERT into `bookings`"), call the endpoint, expect `500`, and assert a snapshot of every table equals the snapshot before. Also: a test terminates the backend (`pg_terminate_backend`) mid-transaction. Production code has no `if TESTING` branches or fault points.
 
-### 6.5 Member cap under concurrency (BR-10)
+### 6.5 Cap under concurrency; lock order; deadlocks
 
-Two simultaneous holds by one member at count = 2 would each see "2 < 3". We serialise per member:
+Two simultaneous holds by one member at count 2 would both see "2 < 3". Serialise per member:
 
 ```sql
-SELECT id FROM members WHERE id = :me FOR UPDATE;      -- first statement of hold & recurring
-SELECT count(*) FROM bookings
- WHERE member_id=:me AND start_at > :now
-   AND (status='CONFIRMED' OR (status='HELD' AND hold_expires_at > :now));
+SELECT id FROM members WHERE id = :me FOR UPDATE;       -- first statement of hold & recurring
+SELECT count(DISTINCT COALESCE(series_id, id))          -- series counts once (BR-10)
+  FROM live_bookings
+ WHERE member_id = :me AND start_at > :now;
 ```
 
-Requests by *different* members never contend on this lock. Confirm and cancel need no cap logic (a hold already counted).
+Different members never contend. Confirm and cancel need no cap logic.
 
-**Lock order** (to avoid deadlocks): `members` row → (idempotency key) → booking rows inserted in ascending `(court_id, start_at)`. Even so, two recurring requests by different members over interleaving slots can deadlock; Postgres aborts one with `40P01`. `db/retry.py` retries the whole use-case up to 3 times with jitter on `40P01` and `40001`. Because the use-case is one transaction, retry is safe.
+**Lock order:** `members` row → booking inserts in ascending `(court_id, start_at)`. Two recurring requests from different members over interleaved slots can still deadlock; Postgres aborts one (`40P01`). `db/retry.py` re-runs the whole use-case (safe: one transaction) up to 3 times with jitter on `40P01`/`40001`.
 
-### 6.6 Isolation level
+### 6.6 Isolation
 
-`READ COMMITTED` plus constraints and targeted `FOR UPDATE`. We rejected `SERIALIZABLE` as the primary mechanism (§16): it would also be correct but turns ordinary contention into retry storms and is harder to reason about from the outside. Constraint-first is simpler to prove.
+`READ COMMITTED` + constraints + targeted locks. `SERIALIZABLE` rejected as the main mechanism (§16): correct but turns contention into retry storms and obscures the proof.
 
-## 7. Domain logic (pure, in `domain/`)
+## 7. API contract
 
-### 7.1 Slots (BR-1, 3, 4)
+Conventions: JSON, `snake_case`, ISO-8601 timestamps (responses in UTC `Z`), no version prefix (paths are fixed). Errors are `application/problem+json` (§8). **README.md is the user-facing contract with copy-pasteable curl for every call; this section is the same contract in design form.**
 
-`slots_for(venue, local_date)` builds each slot as a zone-aware local datetime at `opens_at … closes_at` in 1-hour steps, converts to UTC. DST: a non-existent local hour (spring-forward gap) is skipped; an ambiguous hour (fall-back) uses the first occurrence (`fold=0`). `validate_slot(venue, start_at, now)` rejects: not exactly an hour boundary in venue-local time, outside opening hours, `start_at ≤ now`, `start_at > now + horizon`.
+**Identity (D-02) — one place.** `api/deps.py` exposes `current_member()` (reads `X-Member-Id`, returns a `MemberId`) and `require_staff()` (reads `X-Staff-Key`, `hmac.compare_digest` against `STAFF_API_KEY`). Routers and services receive typed values and never see headers. Replacing this with JWT/OIDC edits only `deps.py`. A test asserts the strings `X-Member-Id` and `X-Staff-Key` appear in no other source file.
 
-### 7.2 Pricing (BR-8, 9)
+### 7.1 `POST /holds` — member
 
-`price_for(venue, start_at)` → `(band, cents)`. Convert to venue-local; peak if `weekday` has a window with `start_time ≤ local_time < end_time`. Output is snapshotted onto the booking row at hold time; confirm never recomputes.
+Body: `{"court_id": "<uuid>", "start_at": "<ISO-8601 with offset>"}`
 
-### 7.3 Refund (BR-11)
+`201` new hold, **`200` same member repeating a live hold for the same slot**:
 
-```python
-def refund_cents(price_cents: int, start_at: datetime, now: datetime) -> int:
-    return price_cents if start_at - now >= timedelta(hours=24) else 0
+```json
+{"id":"…","court_id":"…","member_id":"…",
+ "start_at":"2026-12-01T10:00:00Z","end_at":"2026-12-01T11:00:00Z",
+ "status":"HELD","price_band":"OFFPEAK","price_cents":1200,"currency":"USD",
+ "expires_at":"2026-11-30T09:05:00Z"}
 ```
 
-Unit-tested at 24h+1s, exactly 24h, 24h−1s, and after start (the last is rejected earlier, BR-12).
+Errors: `401 missing_identity`, `404 member_not_found | court_not_found`, `409 slot_unavailable | booking_limit_reached`, `422 invalid_slot | validation_error`.
 
-### 7.4 Utilization (BR-18, FR-6)
+Flow: lock member → `now` → validate slot (aligned, inside hours, future, ≤ horizon) → replay lookup → cap → price → `INSERT` (trigger evicts stale; constraint decides). `hold_expires_at = least(now + TTL, start_at)`.
 
-Week = ISO week, Monday 00:00 to next Monday 00:00 in venue-local time. 
+### 7.2 `POST /holds/{id}/confirm` — member
 
-- `bookable_hours(court, week)` = count of slots from `slots_for` over the 7 local dates (so DST weeks are right).
-- `booked_hours` = SQL: `SELECT court_id, band, count(*) FROM bookings WHERE status='CONFIRMED' AND start_at >= :week_start AND start_at < :week_end GROUP BY court_id, band`.
-- Response: per court `{booked_hours, bookable_hours, utilization_pct, peak_hours, offpeak_hours}` and a venue total. Inactive courts are excluded from the denominator.
+No body. `200` first call and every replay (replay adds `Idempotent-Replay: true`):
+
+```json
+{"id":"…","court_id":"…","member_id":"…","status":"CONFIRMED","confirmed_at":"…",
+ "start_at":"…","end_at":"…","price_band":"OFFPEAK","price_cents":1200,"currency":"USD"}
+```
+
+Errors: `404 hold_not_found`, `409 hold_expired | invalid_state`.
+
+### 7.3 `POST /bookings/{id}/cancel` — member
+
+No body. `200`:
+
+```json
+{"id":"…","status":"CANCELLED","cancelled_at":"…",
+ "price_cents":1200,"refund_percent":100,"refund_cents":1200,"currency":"USD"}
+```
+
+Replay returns the **stored** values. Cancelling a live hold: `refund_percent 0`, `refund_cents 0`. Errors: `404 booking_not_found`, `409 booking_started | hold_expired`.
+
+### 7.4 `GET /courts/{id}/availability?from=YYYY-MM-DD&to=YYYY-MM-DD` — no auth
+
+`from`/`to` are **venue-local dates**; `to` exclusive (default `from + 1 day`); `from` default = today (venue-local); max span 14 days.
+
+```json
+{"court_id":"…","timezone":"UTC",
+ "slots":[{"start_at":"2026-12-01T06:00:00Z","end_at":"2026-12-01T07:00:00Z",
+           "status":"AVAILABLE","price_band":"OFFPEAK","price_cents":1200,"currency":"USD"}, …]}
+```
+
+`status` ∈ `AVAILABLE | HELD | BOOKED`. Started slots omitted. Reads `live_bookings`, so expired holds appear `AVAILABLE`. No member identity exposed. Errors: `404 court_not_found`, `422 validation_error`.
+
+### 7.5 `POST /recurring-bookings` — member (week 3)
+
+Body: `{"court_id":"…","first_start_at":"2026-12-01T10:00:00Z","weeks":12}`
+
+`201`:
+
+```json
+{"series_id":"…","court_id":"…","member_id":"…","weeks":12,
+ "total_price_cents":14400,"currency":"USD",
+ "bookings":[{"id":"…","start_at":"2026-12-01T10:00:00Z","end_at":"…","status":"CONFIRMED",
+              "price_band":"OFFPEAK","price_cents":1200}, …]}
+```
+
+Errors: `409 series_conflict` with `"conflicts":[{"start_at":"…"}]` (pre-check; a race loser gets the same code with the single colliding slot); `409 booking_limit_reached`; `422 invalid_slot` (any occurrence outside hours/not aligned/first beyond horizon, or `weeks` outside 2–12). Occurrences: same **local** wall-clock time every 7 days in the venue zone. Atomic (§6.4).
+
+### 7.6 `GET /staff/utilization?week=2026-W48[&venue_id=…]` — staff (week 3)
+
+```json
+{"week":"2026-W48","week_start":"2026-11-23","week_end":"2026-11-30",
+ "venues":[{"venue_id":"…","name":"Riverside Sports Club","timezone":"UTC",
+            "booked_hours":31,"bookable_hours":224,"utilization_pct":13.8,
+            "courts":[{"court_id":"…","name":"Court 1","booked_hours":20,"bookable_hours":112,
+                       "utilization_pct":17.9,"peak_hours":9,"offpeak_hours":11}]}]}
+```
+
+`week_end` exclusive. Errors: `401 invalid_staff_key`, `422 validation_error`.
+
+### 7.7 Should-tier: `GET /courts`, `POST /recurring-bookings/{series_id}/cancel`; `GET /healthz`.
 
 ## 8. Error model
 
-`application/problem+json`: `{ "type": "…", "title": "…", "status": 409, "code": "slot_unavailable", "detail": "…", "request_id": "…" }`. `code` is the stable, machine-readable field; clients/tests should switch on it.
+`application/problem+json`: `{"type":"about:blank","title":"…","status":409,"code":"slot_unavailable","detail":"…"}` — **switch on `code`**.
 
 | Status | Codes |
 |---|---|
 | 401 | `missing_identity`, `invalid_staff_key` |
-| 404 | `court_not_found`, `hold_not_found`, `booking_not_found`, `member_not_found` |
-| 409 | `slot_unavailable`, `booking_limit_reached`, `hold_expired`, `invalid_state`, `booking_started`, `slot_started`, `series_conflict` |
-| 422 | `invalid_slot`, `idempotency_key_reuse`, validation errors |
+| 404 | `member_not_found`, `court_not_found`, `hold_not_found`, `booking_not_found` |
+| 409 | `slot_unavailable`, `booking_limit_reached`, `hold_expired`, `invalid_state`, `booking_started`, `series_conflict` |
+| 422 | `invalid_slot`, `validation_error` |
 | 500 | `internal_error` (never leaks SQL) |
 
-DB errors are translated in one place: `23P01` → `slot_unavailable`; `23505` on `ledger_entries` should be unreachable (it is caught in tests, a 500 if ever seen).
+`23P01` → `slot_unavailable` (or `series_conflict` for recurring). `23505` on `ledger_entries` is unreachable by design; if seen it is a 500 and a bug.
 
-## 9. Background worker
+## 9. No background worker (cut) — what that means
 
-`python -m courtlock.worker` loops every 30 s:
+Nothing needs one. Expired holds are ignored by the trigger, the view, and the conditional `UPDATE`s. Rows stay `HELD` past expiry. Optional hygiene, not shipped:
 
-1. Expire stale holds in batches of 500 (`FOR UPDATE SKIP LOCKED`).
-2. Delete idempotency keys older than 24 h.
-3. Log counts. Exposes liveness via file touch / log heartbeat.
+```sql
+UPDATE bookings SET status='EXPIRED' WHERE status='HELD' AND hold_expires_at <= clock_timestamp();
+```
 
-Idempotent and safe to run on several nodes. Killing it must never change any test outcome (there is a test for exactly that).
+(Documented for operators; safe to run any time; covered by a test that runs it and checks no behaviour changes.)
 
-## 10. Test strategy
+## 10. Domain logic (pure, `domain/`)
 
-Tests run against **real Postgres** (no SQLite, no mocks for the DB — the guarantees live in Postgres). Each test gets a clean schema via template database / truncation.
+- **Slots:** `slots_for(venue, local_date)` builds zone-aware local datetimes `opens_at … closes_at` in 1-hour steps → UTC. DST: a non-existent local hour is skipped; an ambiguous one uses `fold=0`. `validate_slot(venue, start_at, now)` rejects: not on a venue-local hour boundary, outside opening hours, `start_at ≤ now`, `start_at > now + horizon`.
+- **Pricing:** `price_for(venue, start_at)` → `(band, cents)`; peak iff the venue-local weekday has a window with `start_time ≤ local_time < end_time`. Snapshotted onto the row at hold time.
+- **Refund:** 
 
-| Guarantee | Tests that prove it |
+```python
+def refund_percent(start_at: datetime, now: datetime) -> int:
+    return 100 if start_at - now >= timedelta(hours=24) else 0
+```
+
+  `now` is the DB's `clock_timestamp()` fetched inside the transaction after the lock. Unit tests: 24 h + 1 s, exactly 24 h, 24 h − 1 s.
+- **Recurring occurrences:** `occurrences(venue, first_start_at, weeks)` → local wall-clock +7 days each, converted to UTC, each validated as a slot.
+- **Utilization (week 3):** week = ISO week, Mon 00:00 → next Mon 00:00 venue-local. `bookable_hours` = slots from `slots_for` over the 7 local dates (DST-correct), active courts only. `booked_hours` = `SELECT court_id, band, count(*) FROM bookings WHERE status='CONFIRMED' AND start_at >= :ws AND start_at < :we GROUP BY …`.
+
+## 11. Test strategy
+
+Real Postgres everywhere (no SQLite, no DB mocks): the guarantees live in Postgres.
+
+**Time without a fake clock** (consequence of BR-22):
+- *Expiry:* tests **back-date** `hold_expires_at` with SQL (`UPDATE bookings SET hold_expires_at = clock_timestamp() - interval '1 second' WHERE id = …`). One slow end-to-end test uses `HOLD_TTL_SECONDS=1` and sleeps 1.2 s.
+- *24 h rule:* the exact boundary is a **unit test** on `refund_percent`; HTTP/integration tests use slots 25 h and 23 h away (±1 h margin).
+- *Price lock:* change the venue price between hold and confirm; the charge equals the snapshot.
+
+| Guarantee | Tests |
 |---|---|
-| **G1** no double booking | (a) **N-way race over HTTP:** 100 threads, one slot, barrier-released → exactly 1×201, 99×409, 1 active row. Repeated 50 rounds. (b) **Many slots, many members:** 200 requests over 20 slots → ≤ 1 active row per slot, count of 201s == count of rows. (c) **Direct SQL attack:** two `INSERT`s in separate connections, and overlapping ranges, must raise `ExclusionViolation`; proves the DB, not the app, enforces it. (d) **Hold vs. hold on expiry boundary** with a fake clock. (e) **Hypothesis stateful test:** random sequences of hold/confirm/cancel/expire-by-time-advance compared to an in-memory model; invariant "no overlap among active rows" checked after every step. (f) Different-court / adjacent-hour holds both succeed (no false conflicts). |
-| **G1 + BR-6** expiry | Hold, advance clock past TTL, worker **not running**, another member holds the same slot → 201. Confirm on expired hold → 409. Availability shows it free. |
-| **G2** retried confirm | Confirm 20× sequentially → same body, 1 ledger CHARGE, 1 CONFIRMED row. Confirm 20× **concurrently** → same. Simulated timeout: server completes, client "never saw" response, retries → same. Cancel replays → 1 REFUND. `Idempotency-Key` hold replays and mismatched-body replay (422). Direct SQL: second ledger row with same `(booking_id, kind)` rejected. |
-| **G3** no partial state | Fault injection at every checkpoint in confirm, cancel, hold, recurring create/cancel; assert whole-DB snapshot equality. Recurring where week 3 of 4 conflicts → 409, zero rows (series, bookings, ledger, keys) created. Recurring where the quota would be exceeded at occurrence 3 → nothing written. |
-| BR-10 cap | Sequential: 4th hold → 409. **Concurrent:** 10 simultaneous holds on 10 different slots by one member → exactly 3 succeed. Cancel frees one. Expired hold stops counting. |
-| BR-11 refund | Unit boundary tests (24h±1s) + HTTP test with fake clock. |
-| BR-9 pricing | Unit tests per venue/weekday/window edges; DST day; price locked across a peak boundary between hold and confirm. |
-| BR-18 utilization | Seeded fixture with known bookings → exact numbers; cancelled/expired/held excluded; DST week denominator. |
-| Contract | Black-box tests for the 4 fixed endpoints exactly as a third party would call them (separate `tests/contract/`, uses only HTTP). |
-| Hygiene | `tests/test_no_suppressions.py` greps `src/` and `tests/` for `noqa`/`type: ignore`. |
+| **G1** | **(a)** 100 threads, one slot, released by a `Barrier` → exactly 1×201, 99×409, 1 active row; repeated 50 rounds. **(b)** 200 requests over 20 slots from many members → ≤ 1 active row per slot; #201 == #rows. **(c)** Direct SQL: overlapping inserts in two connections raise `ExclusionViolation`. **(d)** Adjacent hours and different courts don't conflict. **(e)** *(should)* Hypothesis stateful test vs an in-memory model; invariant "no overlap among active rows" after every step. |
+| **BR-6** expiry | Hold, back-date expiry, **no cleanup**, another member holds the slot → 201. Confirm after expiry → 409. Availability shows it free. |
+| **Recurring × expired hold** *(the review's case)* | **T-R1** B books a 4-week series; A's hold on week 2 is back-dated expired and unswept → `201`, A's row now `EXPIRED`. **T-R2** Same, plus a *live* hold on week 4 → `409 series_conflict` listing exactly week 4; **every table identical to before** (stale hold still `HELD`). **T-R3** Raw-SQL `INSERT` over an expired hold succeeds; over a live hold fails. **T-R4** Single hold over an expired hold succeeds (the v0.1 path). **T-R5** 20 concurrent recurring requests for one court/time → exactly 1 succeeds, none leaves a partial series; concurrent recurring + single hold on overlapping slots → exactly one wins; no `500` from deadlocks. |
+| **G2** | Confirm ×20 sequential → same body, 1 CHARGE, 1 CONFIRMED row. Confirm ×20 **concurrent** → same. "Lost response" simulation (server completes, client discards, retries) → same. Cancel ×20 → 1 REFUND. Repeat `POST /holds` → same hold. Direct SQL: second ledger row with same `(booking_id, kind)` rejected. |
+| **G3** | Failure injection by temporary DB triggers (§6.4) for every statement of hold, confirm, cancel, recurring (week 3) → whole-DB snapshot identical. Recurring where occurrence 3 of 4 conflicts, and where the cap would be exceeded → nothing written. `pg_terminate_backend` mid-transaction → nothing written. |
+| **BR-10** cap | Sequential: 4th → 409. **Concurrent:** 10 simultaneous holds, one member, 10 slots → exactly 3 succeed. Cancel frees one. Expired hold stops counting. **Series:** 12-week series + 2 singles = 3 OK; 4th → 409; cancelling one occurrence does not free cap; cancelling the last does. |
+| BR-11 | Unit boundary tests + HTTP at 25 h / 23 h. |
+| BR-9 | Unit: venue/weekday/window edges, DST day; price locked across venue price change. |
+| BR-18 | Seeded fixture → exact numbers; cancelled/held excluded; DST week denominator. |
+| Contract | `tests/contract/` uses only HTTP, with the exact bodies and headers shown in the README. |
+| README | `scripts/readme_check.py` extracts the README's `bash` blocks and runs them in order against the compose stack (CI); fails on any non-2xx other than ones the README marks as expected. |
+| Hygiene | No `noqa` / `type: ignore`; header names only in `deps.py`; availability, cap, replay and series pre-check queries read `live_bookings` (a test inspects the compiled SQL). |
 
-**Clock:** `clock.py` defines `Clock` (`now() -> datetime`). Production uses the system UTC clock; tests inject a controllable fake through a FastAPI dependency override, which is how we test 5-minute and 24-hour behaviour without sleeping. Every service takes `now` from the clock once, at the start of the use-case.
+## 12. Deployment & CI
 
-**Determinism:** concurrency tests use a `threading.Barrier` to release all requests together, and assert on the DB end-state (not on timing).
-
-## 11. Deployment, CI
-
-**docker compose** (`docker compose up`):
+**docker compose up**
 
 | Service | Detail |
 |---|---|
-| `db` | `postgres:15`, volume, healthcheck `pg_isready` |
-| `migrate` | same image as api; `alembic upgrade head` then `python -m courtlock.seed` (idempotent) ; `depends_on: db healthy` |
-| `api` | `uvicorn courtlock.main:app`, port 8000, `depends_on: migrate completed_successfully`, `/readyz` healthcheck |
-| `worker` | `python -m courtlock.worker` |
+| `db` | `postgres:15`, volume, `pg_isready` healthcheck |
+| `migrate` | api image; `alembic upgrade head` then `python -m courtlock.seed` (idempotent; fixed UUIDs); `depends_on: db healthy` |
+| `api` | `uvicorn courtlock.main:app` on :8000; `depends_on: migrate completed_successfully`; `/healthz` healthcheck; env `DATABASE_URL`, `STAFF_API_KEY`, `HOLD_TTL_SECONDS`, `MAX_ACTIVE_BOOKINGS`, `BOOKING_HORIZON_DAYS` |
 
-Pool: `pool_size=10, max_overflow=10` per api process; Uvicorn threadpool limited to the same ceiling so requests queue in the app, not as DB connection errors.
+Pool: `pool_size=10, max_overflow=10` per process; Uvicorn threadpool bounded to the same ceiling.
 
-**CI** (`.github/workflows/ci.yml`, on push + PR):
+**CI** (`.github/workflows/ci.yml`): `uv sync --frozen` → `ruff check` + `ruff format --check` → `mypy --strict src tests` → suppression grep → `pytest` against a `postgres:15` service (migrations via Alembic; `alembic check` for drift) → `docker compose up -d --build --wait` → `scripts/readme_check.py` → `docker compose down -v`. Week 2 ships all of these except the recurring/utilization portions.
 
-1. `uv sync --frozen`
-2. `ruff check` and `ruff format --check`
-3. `mypy --strict src tests`
-4. suppression grep
-5. `pytest` against a `postgres:15` service container (migrations applied via Alembic, so migrations are tested too; also `alembic check` for model/migration drift)
-6. `docker compose up -d --build --wait` + curl the four contract endpoints (smoke) + `docker compose down -v`
+## 13. Time, scale, known edges
 
-## 12. Evolution: real payments (Q-2)
-
-If a payment gateway is added, calling it inside the booking transaction would break G3 (charge succeeds, DB rolls back) and hold DB locks across network I/O. The plan: `payment_intents` rows + **transactional outbox**; confirm moves `HELD → PENDING_PAYMENT → CONFIRMED` via gateway webhook, using the gateway's own idempotency key = booking id. Out of scope for v1 but the one-row state machine and the ledger's uniqueness already fit it.
-
-## 13. Time, scale, and known edges
-
-- App-supplied time (injectable clock) instead of Postgres `now()`: needed for deterministic tests. Cost: with several api instances, clock skew can shift an expiry by the skew. Mitigation option if it matters: compute `now` from `SELECT clock_timestamp()` in production (one extra round trip) and keep the fake clock in tests. Documented in LIMITATIONS.md.
-- Hot slot (everybody wants Saturday 10:00): contention is on one index key; losers fail fast with 409 after waiting for the winner's commit (ms).
-- Large availability ranges are capped at 14 days; one query per request.
-- No rate limiting in v1 (a member can create/release holds in a loop up to the cap; only wasteful, not unsafe).
+- **One clock.** `clock_timestamp()` is read inside the transaction *after* the first lock (so a request that waited on a lock evaluates expiry at the moment it acts, not at transaction start; `now()` would be the transaction start and could be stale). If the DB clock steps (bad NTP), expiry and the 24 h rule move with it. Single primary assumed; with replicas, writes still go to the primary.
+- Hot slot: contention is one index key; losers fail fast with 409.
+- Availability span capped at 14 days.
+- No rate limiting (a member can create/release holds in a loop; wasteful, not unsafe).
 
 ## 14. Live-change preparation
 
-Changes an examiner might ask for, and where they land:
-
 | Change | Where |
 |---|---|
-| Hold TTL 5 → 10 min | `HOLD_TTL_SECONDS` env |
-| Refund tiers (e.g. 50 % at ≥ 6 h) | `domain/refund.py` only + unit test |
-| Cap 3 → 5, or series counts as one | `MAX_ACTIVE_BOOKINGS` / the count query in `domain/quota.py` + `services/` |
-| 2-hour bookings | `duration_hours` on request; `CHECK` relaxed; exclusion constraint unchanged |
-| Court maintenance blocks | new status `BLOCKED` (or `kind` column) inside the same exclusion constraint |
-| Weekend surcharge / holidays | `peak_windows` data or `domain/pricing.py` |
-| Different opening hours per weekday | `venue_hours` table; `slots_for` reads it |
-| Auth scheme | `api/deps.py` |
+| Hold TTL | `HOLD_TTL_SECONDS` |
+| Refund tiers (e.g. 50 % ≥ 6 h) | `domain/refund.py` + unit test |
+| Cap value; series counts per occurrence instead | `MAX_ACTIVE_BOOKINGS`; the `COUNT(DISTINCT COALESCE(series_id,id))` query (drop the `COALESCE`) |
+| 2-hour bookings | `duration_hours` in request; relax `CHECK`; exclusion constraint unchanged |
+| Court maintenance blocks | new `kind`/status inside the same constraint (trigger and view already apply) |
+| Holidays / weekend pricing | `peak_windows` data or `domain/pricing.py` |
+| Per-weekday hours | `venue_hours` table; `slots_for` reads it |
+| Auth scheme | `api/deps.py` only |
 
 ## 15. Decision log
 
 | ID | Decision | Reason |
 |---|---|---|
-| D-01 | Postgres exclusion constraint is the double-booking guard | Enforced for every writer, every instance, no coordination code |
-| D-02 | Identity via `X-Member-Id` / `X-Staff-Key` from an upstream gateway | Auth is not in the brief; isolated in one module |
-| D-03 | Single `bookings` table; hold id == booking id | No gap between hold release and booking creation; natural confirm idempotency |
-| D-04 | Expiry applied by the hold transaction itself; worker is housekeeping | Correctness independent of a job |
-| D-05 | `READ COMMITTED` + constraints + row locks | Simple, provable, low contention |
-| D-06 | Per-member `SELECT … FOR UPDATE` to serialise the cap | Only way to make a count-then-insert rule race-free without serializable |
-| D-07 | Payment = internal ledger with unique `(booking_id, kind)` | Keeps G2/G3 provable; real gateway deferred (§12) |
-| D-08 | Price snapshotted at hold time | Member sees what they pay; stable under price/peak changes |
-| D-09 | Sync SQLAlchemy + psycopg 3 | DB-bound; simpler typing and transactions |
-| D-10 | App-injected clock | Deterministic tests of TTL and the 24 h rule |
-| D-11 | Recurring = atomic, one step, N ordinary bookings | Reuses every guarantee for free; no virtual occurrences |
-| D-12 | Slots are 1 h, venue-local aligned; DB stores UTC ranges | Matches the brief; range type allows later extension |
+| D-01 | Exclusion constraint is the double-booking guard | Enforced for every writer and instance |
+| D-02 | Identity via `X-Member-Id` / `X-Staff-Key`, read only in `api/deps.py` | Auth not in the brief; cheap to change |
+| D-03 | Single `bookings` table; hold id == booking id | No gap at confirm; natural confirm idempotency |
+| D-04 | **`BEFORE INSERT` trigger evicts expired holds** *(replaces v0.1 app-side eviction)* | Every insert path gets BR-6; fixes the recurring bug |
+| D-05 | `READ COMMITTED` + constraints + row locks | Simple and provable |
+| D-06 | Per-member `SELECT … FOR UPDATE` serialises the cap | Race-free count-then-insert |
+| D-07 | Payment = internal ledger, `UNIQUE(booking_id, kind)` | Keeps G2/G3 provable |
+| D-08 | Price snapshotted at hold | Stable under price changes |
+| D-09 | Sync SQLAlchemy + psycopg 3 | DB-bound; simpler |
+| D-10 | **DB clock (`clock_timestamp()`), no app clock** *(replaces v0.1 injectable clock)* | One time source across instances |
+| D-11 | Recurring = atomic, one step, N ordinary bookings | Reuses every guarantee |
+| D-12 | 1 h slots, venue-local aligned, UTC ranges | Brief; range type extends later |
 | D-13 | Zero inline suppressions, enforced in CI | Stated requirement |
+| D-14 | **`live_bookings` view = the one definition of "live"** | No second definition to get wrong |
+| D-15 | **Series counts once toward cap** *(replaces per-occurrence)* | "Weekly recurring" must be usable; cost in DESIGN §14 |
+| D-16 | `POST /holds` replay returns member's live hold; no idempotency-key table | Covers real retries with less machinery |
+| D-17 | Failure injection by temporary DB triggers, not production hooks | No test-only code in production paths |
+| D-18 | No worker in v1 | Nothing depends on it |
 
 ## 16. Alternatives rejected (technical)
 
 | Alternative | Why not |
 |---|---|
-| **Application-level locks** (Python `threading.Lock`, in-process dict) | Only works with one process; lost on restart. |
-| **Redis / distributed lock** around check-then-insert | A second system whose failure (lease expiry, GC pause) re-opens double-booking; the DB is already the single source of truth. |
-| **`SELECT … FOR UPDATE` on court row, then check-and-insert** | Correct, but serialises all bookings on a court and relies on every writer remembering to take the lock. The constraint protects writers that forget. |
-| **Pre-generated slot rows + `UNIQUE(court_id, start_at)`** | Simple and valid for 1 h slots, but needs a job to materialise slots, breaks for variable-length bookings, and creates a state where slots "don't exist yet". Exclusion constraint on ranges needs no materialisation. |
-| **Two tables (`holds`, `bookings`)** | Needs cross-table exclusion (not supported), and a gap at confirm. |
-| **`SERIALIZABLE` isolation everywhere** | Valid but converts contention to retry storms and obscures the proof. May be reconsidered as defence in depth. |
-| **TTL via Redis key expiry / `pg_cron`-only expiry** | Moves a correctness property to a component that can be down. |
-| **Optimistic concurrency (version column) for confirm** | Row lock is simpler and gives a clean "second confirm waits, then replays". |
-| **Idempotency-Key only (no natural idempotency) for confirm** | Would force clients to remember a key; natural idempotency works even for naïve retrying clients, which is what the guarantee asks. |
-| **Async SQLAlchemy / asyncpg** | See §2. |
-| **Calling the payment gateway inside the transaction** | See §12. |
-| **Using Postgres `now()` as the only clock** | Hard to test without sleeping or monkeypatching the DB. |
+| App-level locks / in-memory state | Single-process only; lost on restart. |
+| Redis / distributed lock | A second system whose lease expiry reopens double-booking. |
+| `SELECT … FOR UPDATE` on court row then check-and-insert | Correct but serialises a court and relies on every writer remembering the lock. |
+| Pre-generated slot rows + `UNIQUE(court_id, start_at)` | Needs a materialising job; breaks for variable lengths. |
+| Two tables (`holds`, `bookings`) | No cross-table exclusion; gap at confirm. |
+| `SERIALIZABLE` everywhere | Retry storms; muddies the proof. |
+| **Eviction helper called from each service** | The v0.1 bug: a new path forgets it. A trigger cannot be forgotten. |
+| **Eviction by a worker / cron / Redis TTL** | Moves a correctness property to a component that can be down. |
+| **Application clock / injectable fake clock** | Skew between instances; contradicts the principle. |
+| Postgres `now()` | Transaction-start time can be stale after a lock wait; `clock_timestamp()` is read when we act. |
+| Idempotency-Key table for everything | Natural idempotency covers confirm/cancel; hold replay covers holds. |
+| Production fault-injection hooks | Test-only code in the shipped path. |
+| Async SQLAlchemy | See §3. |
+| Gateway call inside the transaction | Breaks G3 (charge succeeds, DB rolls back). See §17. |
 
-## 17. Security & observability
+## 17. Evolution: real payments (Q-2)
 
-- Staff key compared with `hmac.compare_digest`; secrets only from env; `.env.example` committed, no real secrets.
-- Another member's id returns 404, not 403 (no existence probing).
-- Pydantic validation on all inputs; SQL only via SQLAlchemy parameters.
-- Logs: JSON, request id (`X-Request-Id` echoed), booking id, outcome code; no PII beyond ids.
-- Metrics (stretch): counters for `409 slot_unavailable`, replays, expired holds swept, deadlock retries.
+Calling a gateway inside the booking transaction would break G3 and hold locks across network I/O. Plan if needed: `payment_intents` + transactional outbox; confirm becomes `HELD → PENDING_PAYMENT → CONFIRMED` driven by a webhook; gateway idempotency key = booking id. The one-row state machine and ledger uniqueness already fit that.
+
+## 18. Security & observability
+
+- Staff key via `hmac.compare_digest`; secrets from env only; `.env.example` committed, no real secrets. The seed staff key is dev-only and documented as such.
+- Another member's id returns 404, not 403.
+- Pydantic validation on all inputs; SQL only through SQLAlchemy parameters (raw DDL only in migrations).
+- Plain structured-ish logging with outcome codes; no PII beyond ids. (JSON logs / metrics cut.)
