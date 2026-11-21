@@ -4,7 +4,7 @@
 
 A community club rents sports courts by the hour across a few venues. CourtLock lets members browse availability, hold a court briefly, confirm it, cancel it, and book it weekly. The database guarantees that no court is ever booked twice, retries never create duplicates, and a failed operation never leaves half-written state.
 
-> **Status: design phase.** The design docs are written and under review; **no application code exists yet**, so `docker compose up` does not work yet. This README is the **API contract**: the four fixed endpoints behave *exactly* as shown here, and once the code exists CI executes every `bash` block in the API sections (1–7) below against the running stack, so this page cannot drift from the behaviour. Sections marked **(week 3)** are in the plan but arrive after the four core endpoints.
+> **Status: week 2 complete.** The four fixed endpoints (`POST /holds`, `POST /holds/{id}/confirm`, `POST /bookings/{id}/cancel`, `GET /courts/{id}/availability`) are implemented and run under `docker compose up`, with tests for all three guarantees. This README is the **API contract**: the endpoints behave *exactly* as shown here, and CI runs every `bash` block in sections 1-4 against the running stack, so this page cannot drift from the behaviour. Sections marked **(week 3)** (recurring bookings, staff utilization, court listing) are designed but **not built yet**.
 
 | Doc | Purpose |
 |---|---|
@@ -22,13 +22,13 @@ A community club rents sports courts by the hour across a few venues. CourtLock 
 
 Unconfirmed holds expire after **5 minutes** and then stop blocking the slot immediately, even if nothing ever cleans them up (a database trigger and view guarantee that for every writer).
 
-## Quick start (planned)
+## Quick start
 
 ```bash
 docker compose up --build
 ```
 
-Starts Postgres, migrates, seeds demo data, and serves the API at <http://localhost:8000> (interactive docs at `/docs`).
+Starts Postgres, runs the migration, seeds the demo data below, and serves the API at <http://localhost:8000> (interactive docs at `/docs`). Add `-d` to run it in the background; `docker compose down -v` stops it and wipes the data.
 
 ## Seed data (demo members and courts)
 
@@ -349,19 +349,22 @@ curl -s "$BASE/courts" | jq
 | `MAX_ACTIVE_BOOKINGS` | `3` | per-member cap |
 | `BOOKING_HORIZON_DAYS` | `90` | how far ahead the first slot may be |
 
-## Development (planned)
+## Development
 
 ```bash
-uv sync
-docker compose up -d db
-uv run alembic upgrade head
-uv run pytest                      # unit, integration, concurrency, atomicity, contract
+uv sync                                  # install (Python 3.11+); uv: https://docs.astral.sh/uv/
+docker compose up -d db                  # Postgres on 127.0.0.1:5432 for the tests
+uv run pytest                            # unit, integration, concurrency, atomicity, contract
 uv run ruff check . && uv run ruff format --check .
-uv run mypy --strict src tests
-uv run python scripts/readme_check.py   # runs this README's bash blocks against the stack
+uv run mypy                              # strict; zero inline suppressions
 ```
 
-CI runs the same plus a compose smoke test, and fails on any `# noqa` / `# type: ignore`.
+- The tests create their own `courtlock_test` database and build it by running the real Alembic migration. Point them elsewhere with `TEST_DATABASE_URL`.
+- Run the suite on Python 3.11 exactly as CI does: `docker compose --profile test run --rm test`.
+- Check the README against a running stack (needs `bash`, `curl`, `jq`): `python scripts/readme_check.py`.
+- On Windows, use `127.0.0.1` rather than `localhost` for the database URL: `localhost` tries IPv6 first and each connection stalls for ~8 seconds.
+
+CI (`.github/workflows/ci.yml`) runs ruff, ruff format, mypy, a grep that fails on any `noqa` / `type: ignore`, the full test suite against a `postgres:15` service, then `docker compose up` and the README's curl examples.
 
 ```
 src/courtlock/

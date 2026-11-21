@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft **v0.2** — revised after review of v0.1. Review before any build work continues. |
+| **Status** | Draft **v0.2** (design accepted in review). **Week 2 is built**: see README and TRD v0.3. Recurring bookings, utilization and `GET /courts` are week 3. |
 | **Scope of this doc** | *What* we build and *why*: requirements, assumptions, open questions, rejected alternatives. The *how* lives in [docs/TRD.md](docs/TRD.md). |
 | **Project name** | **CourtLock** — a court is locked to one booking at a time; that is exactly the guarantee this system makes. Sport-neutral, since the club rents courts for all kinds of sports. |
 

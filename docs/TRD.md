@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft **v0.2** — revised after review. Design only; no code yet. |
+| **Status** | **v0.3** — week 2 implemented (4 contract endpoints, schema, guarantees G1-G3 and their tests). Recurring, utilization and `GET /courts` are still design only. |
 | **Companion** | [DESIGN.md](../DESIGN.md) (PRD: rules `BR-*`, requirements `FR-*`, review response §0) · [README.md](../README.md) (the API contract with curl examples) |
 
 This document says *how* we make three guarantees true:
@@ -409,6 +409,10 @@ def refund_percent(start_at: datetime, now: datetime) -> int:
 
 ## 11. Test strategy
 
+**Status (week 2):** 130 tests, all passing on Python 3.11 and 3.13 (unit 36, integration 57, concurrency 24, atomicity 6, contract 3, hygiene 4; see `tests/`). Built and passing: all G1, G2, G3 rows below for hold / confirm / cancel, BR-6, BR-9, BR-10, BR-11, the README walkthrough and the hygiene checks. Deliberately **not built yet** (week 3-4): T-R1..T-R5 and every recurring / utilization row (those endpoints do not exist yet), the DST-week utilization test, and the Hypothesis stateful test (marked *should*).
+
+Guarantee tests were checked by sabotage: removing the exclusion constraint fails 14 G1 tests; removing the expiry trigger fails the 3 BR-6 tests; removing the per-member lock fails the cap race test.
+
 Real Postgres everywhere (no SQLite, no DB mocks): the guarantees live in Postgres.
 
 **Time without a fake clock** (consequence of BR-22):
@@ -429,7 +433,7 @@ Real Postgres everywhere (no SQLite, no DB mocks): the guarantees live in Postgr
 | BR-18 | Seeded fixture → exact numbers; cancelled/held excluded; DST week denominator. |
 | Contract | `tests/contract/` uses only HTTP, with the exact bodies and headers shown in the README. |
 | README | `scripts/readme_check.py` extracts the README's `bash` blocks and runs them in order against the compose stack (CI); fails on any non-2xx other than ones the README marks as expected. |
-| Hygiene | No `noqa` / `type: ignore`; header names only in `deps.py`; availability, cap, replay and series pre-check queries read `live_bookings` (a test inspects the compiled SQL). |
+| Hygiene | No `noqa` / `type: ignore`; header names only in `deps.py`; services never import FastAPI; `domain/` imports no framework or database code. |
 
 ## 12. Deployment & CI
 
@@ -439,11 +443,11 @@ Real Postgres everywhere (no SQLite, no DB mocks): the guarantees live in Postgr
 |---|---|
 | `db` | `postgres:15`, volume, `pg_isready` healthcheck |
 | `migrate` | api image; `alembic upgrade head` then `python -m courtlock.seed` (idempotent; fixed UUIDs); `depends_on: db healthy` |
-| `api` | `uvicorn courtlock.main:app` on :8000; `depends_on: migrate completed_successfully`; `/healthz` healthcheck; env `DATABASE_URL`, `STAFF_API_KEY`, `HOLD_TTL_SECONDS`, `MAX_ACTIVE_BOOKINGS`, `BOOKING_HORIZON_DAYS` |
+| `api` | `uvicorn --factory courtlock.main:create_app` on :8000; `depends_on: migrate completed_successfully`; `/healthz` healthcheck; env `DATABASE_URL`, `STAFF_API_KEY`, `HOLD_TTL_SECONDS`, `MAX_ACTIVE_BOOKINGS`, `BOOKING_HORIZON_DAYS` |
 
 Pool: `pool_size=10, max_overflow=10` per process; Uvicorn threadpool bounded to the same ceiling.
 
-**CI** (`.github/workflows/ci.yml`): `uv sync --frozen` → `ruff check` + `ruff format --check` → `mypy --strict src tests` → suppression grep → `pytest` against a `postgres:15` service (migrations via Alembic; `alembic check` for drift) → `docker compose up -d --build --wait` → `scripts/readme_check.py` → `docker compose down -v`. Week 2 ships all of these except the recurring/utilization portions.
+**CI** (`.github/workflows/ci.yml`): `uv sync --frozen` → `ruff check` + `ruff format --check` → `mypy` (strict, configured in `pyproject.toml`; covers `src`, `tests`, `scripts`) → suppression grep → `pytest` against a `postgres:15` service (the tests build their database by running the real Alembic migration) → `docker compose up -d --build --wait` → `scripts/readme_check.py` → `docker compose down -v`. Week 2 ships all of these except the recurring/utilization portions.
 
 ## 13. Time, scale, known edges
 

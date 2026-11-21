@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  checks:
+    name: Lint, types, tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: courtlock
+          POSTGRES_PASSWORD: courtlock
+          POSTGRES_DB: courtlock
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U courtlock"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      TEST_DATABASE_URL: postgresql+psycopg://courtlock:courtlock@127.0.0.1:5432/courtlock_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.13.9"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: uv sync --frozen
+      - name: Ruff lint
+        run: uv run ruff check .
+      - name: Ruff format
+        run: uv run ruff format --check .
+      - name: Mypy (strict)
+        run: uv run mypy
+      - name: No inline suppressions
+        run: |
+          if grep -rnE "noqa|type: *ignore|pyright: *ignore|fmt: *(off|skip)|pylint: *disable" \
+               --include='*.py' src alembic scripts \
+               | grep -v "^tests/test_hygiene.py"; then
+            echo "inline suppressions are not allowed"; exit 1
+          fi
+      - name: Tests (unit, integration, concurrency, atomicity, contract)
+        run: uv run pytest
+
+  compose-smoke:
+    name: docker compose up + README examples
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start the stack
+        run: docker compose up -d --build --wait --wait-timeout 180
+      - name: Show service state
+        if: always()
+        run: docker compose ps
+      - name: Run the README's curl examples
+        run: python3 scripts/readme_check.py
+      - name: Logs on failure
+        if: failure()
+        run: docker compose logs --no-color
+      - name: Stop the stack
+        if: always()
+        run: docker compose down -v
