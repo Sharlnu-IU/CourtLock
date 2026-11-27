@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | **v0.3** — week 2 implemented (4 contract endpoints, schema, guarantees G1-G3 and their tests). Recurring, utilization and `GET /courts` are still design only. |
+| **Status** | **v0.4** — week 3 implemented: recurring bookings, staff utilization and `GET /courts` on top of the week-2 core. Series cancel, load measurements and the final LIMITATIONS.md are week 4. |
 | **Companion** | [DESIGN.md](../DESIGN.md) (PRD: rules `BR-*`, requirements `FR-*`, review response §0) · [README.md](../README.md) (the API contract with curl examples) |
 
 This document says *how* we make three guarantees true:
@@ -352,7 +352,7 @@ Body: `{"court_id":"…","first_start_at":"2026-12-01T10:00:00Z","weeks":12}`
               "price_band":"OFFPEAK","price_cents":1200}, …]}
 ```
 
-Errors: `409 series_conflict` with `"conflicts":[{"start_at":"…"}]` (pre-check; a race loser gets the same code with the single colliding slot); `409 booking_limit_reached`; `422 invalid_slot` (any occurrence outside hours/not aligned/first beyond horizon, or `weeks` outside 2–12). Occurrences: same **local** wall-clock time every 7 days in the venue zone. Atomic (§6.4).
+Errors: `409 series_conflict` with `"conflicts":[{"start_at":"…"}]` (from a pre-check that ignores expired holds; a request that loses a race for a week gets the same code without a list; nothing is booked either way); `409 booking_limit_reached`; `422 invalid_slot` (any occurrence outside hours, not aligned, on a local time that does not exist, or the first slot past/beyond the horizon) and `422 validation_error` (`weeks` outside 2–12 or a malformed body). `404 member_not_found | court_not_found`. Occurrences: same **local** wall-clock time every 7 days in the venue zone. Atomic (§6.4).
 
 ### 7.6 `GET /staff/utilization?week=2026-W48[&venue_id=…]` — staff (week 3)
 
@@ -366,7 +366,9 @@ Errors: `409 series_conflict` with `"conflicts":[{"start_at":"…"}]` (pre-check
 
 `week_end` exclusive. Errors: `401 invalid_staff_key`, `422 validation_error`.
 
-### 7.7 Should-tier: `GET /courts`, `POST /recurring-bookings/{series_id}/cancel`; `GET /healthz`.
+### 7.7 `GET /courts` (no auth) and `GET /healthz`
+
+`GET /courts` returns `{"courts":[{id, name, sport, venue_id, venue_name, timezone}]}` for active courts, ordered by venue then court name. `POST /recurring-bookings/{series_id}/cancel` (cancel a whole series atomically) is still *should*, planned for week 4.
 
 ## 8. Error model
 
@@ -375,7 +377,7 @@ Errors: `409 series_conflict` with `"conflicts":[{"start_at":"…"}]` (pre-check
 | Status | Codes |
 |---|---|
 | 401 | `missing_identity`, `invalid_staff_key` |
-| 404 | `member_not_found`, `court_not_found`, `hold_not_found`, `booking_not_found` |
+| 404 | `member_not_found`, `court_not_found`, `venue_not_found`, `hold_not_found`, `booking_not_found` |
 | 409 | `slot_unavailable`, `booking_limit_reached`, `hold_expired`, `invalid_state`, `booking_started`, `series_conflict` |
 | 422 | `invalid_slot`, `validation_error` |
 | 500 | `internal_error` (never leaks SQL) |
@@ -409,9 +411,9 @@ def refund_percent(start_at: datetime, now: datetime) -> int:
 
 ## 11. Test strategy
 
-**Status (week 2):** 130 tests, all passing on Python 3.11 and 3.13 (unit 36, integration 57, concurrency 24, atomicity 6, contract 3, hygiene 4; see `tests/`). Built and passing: all G1, G2, G3 rows below for hold / confirm / cancel, BR-6, BR-9, BR-10, BR-11, the README walkthrough and the hygiene checks. Deliberately **not built yet** (week 3-4): T-R1..T-R5 and every recurring / utilization row (those endpoints do not exist yet), the DST-week utilization test, and the Hypothesis stateful test (marked *should*).
+**Status (week 3):** 203 tests, all passing (unit 54, integration 108, concurrency 28, atomicity 6, contract 3, hygiene 4; see `tests/`). Built and passing: every G1, G2 and G3 row below for hold / confirm / cancel **and for recurring bookings**; T-R1 to T-R5 (the expired-but-unswept-hold walk-through, in `integration/test_recurring.py`, `concurrency/test_double_booking.py` and `concurrency/test_recurring_races.py`); BR-6, BR-9, BR-10 (series counted once), BR-11, BR-18 (utilization, including clock-change weeks and venue-local week boundaries); the README walkthrough and the hygiene checks. Still **not built** (week 4): the Hypothesis stateful test (*should*), series cancel, and a load measurement against NFR-1.
 
-Guarantee tests were checked by sabotage: removing the exclusion constraint fails 14 G1 tests; removing the expiry trigger fails the 3 BR-6 tests; removing the per-member lock fails the cap race test.
+Guarantee tests were checked by sabotage: removing the exclusion constraint fails 14 G1 tests; removing the expiry trigger fails the 3 BR-6 tests; removing the per-member lock fails the cap race test. For recurring: recreating the v0.1 bug (a series pre-check that reads raw `HELD` rows instead of `live_bookings`) fails T-R1 and T-R2; dropping the expiry trigger fails T-R1; counting every occurrence toward the cap (the v0.1 reading) fails the two series-cap tests.
 
 Real Postgres everywhere (no SQLite, no DB mocks): the guarantees live in Postgres.
 

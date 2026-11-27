@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft **v0.2** (design accepted in review). **Week 2 is built**: see README and TRD v0.3. Recurring bookings, utilization and `GET /courts` are week 3. |
+| **Status** | Draft **v0.2** (design accepted in review). **Weeks 2 and 3 are built**: see README and TRD v0.4. Series cancel, load measurements and the final LIMITATIONS.md are week 4. |
 | **Scope of this doc** | *What* we build and *why*: requirements, assumptions, open questions, rejected alternatives. The *how* lives in [docs/TRD.md](docs/TRD.md). |
 | **Project name** | **CourtLock** — a court is locked to one booking at a time; that is exactly the guarantee this system makes. Sport-neutral, since the club rents courts for all kinds of sports. |
 
@@ -112,10 +112,10 @@ Where the brief is silent or contradicts itself we **decide, write it down, and 
 | FR-2 | `POST /holds/{id}/confirm` | Core | Within TTL → `200` `CONFIRMED` booking (`id` = hold id). Repeating it any number of times, sequentially or concurrently → `200`, same body, **one** ledger charge. After TTL → `409 hold_expired`. Someone else's hold → `404`. |
 | FR-3 | `POST /bookings/{id}/cancel` | Core | ≥ 24 h → refund 100 %; < 24 h → 0 %; repeat → same stored result, ≤ 1 refund ever; started → `409 booking_started`; live hold → released, refund 0. |
 | FR-4 | `GET /courts/{id}/availability` | Core | Every slot in the venue-local date range with `AVAILABLE` / `HELD` / `BOOKED` + price. Expired holds show `AVAILABLE`. No auth. |
-| FR-5 | `POST /recurring-bookings` | Required, wk 3 | All-or-nothing (BR-16). Series spanning a slot with an **expired unswept hold** succeeds. A live conflict → `409 series_conflict` listing conflicting dates; **zero** rows written. Counts once toward cap. |
-| FR-6 | `GET /staff/utilization?week=YYYY-Www[&venue_id=]` | Required, wk 3 | Per court and per venue (BR-18), with peak/off-peak split. Staff key required. |
-| FR-7 | `GET /courts` | Should | List active courts with venue, sport, timezone. |
-| FR-8 | `POST /recurring-bookings/{id}/cancel` | Should | Cancel all future occurrences atomically; each refunded per BR-11. |
+| FR-5 | `POST /recurring-bookings` | Required — **built (wk 3)** | All-or-nothing (BR-16). Series spanning a slot with an **expired unswept hold** succeeds. A live conflict → `409 series_conflict` listing conflicting dates; **zero** rows written. Counts once toward cap. |
+| FR-6 | `GET /staff/utilization?week=YYYY-Www[&venue_id=]` | Required — **built (wk 3)** | Per court and per venue (BR-18), with peak/off-peak split. Staff key required. |
+| FR-7 | `GET /courts` | Should — **built (wk 3)** | List active courts with venue, sport, timezone. |
+| FR-8 | `POST /recurring-bookings/{id}/cancel` | Should — week 4 | Cancel all future occurrences atomically; each refunded per BR-11. |
 
 ## 8. Non-functional requirements
 
@@ -210,9 +210,9 @@ Where the brief is silent or contradicts itself we **decide, write it down, and 
 | Phase | Output | Exit criterion |
 |---|---|---|
 | **Week 1** | This PRD, TRD, README. | Reviewed (done once; v0.2 is the re-review). |
-| **Week 2** | **All four endpoints** under `docker compose up`; schema, trigger, view; pricing; cap; refund; seed; G1/G2/G3 tests; README examples running in CI. | A reviewer can run every README curl and the guarantee tests are green. |
-| **Week 3** | Recurring (+ walk-through tests T-R1…T-R5), utilization, `GET /courts`, draft LIMITATIONS.md. | Brief's feature list complete. |
-| **Week 4** | Series cancel, DST tests, stateful property test, LIMITATIONS.md final, walkthrough rehearsal (TRD §14). | — |
+| **Week 2** ✅ | **All four endpoints** under `docker compose up`; schema, trigger, view; pricing; cap; refund; seed; G1/G2/G3 tests; README examples running in CI. | A reviewer can run every README curl and the guarantee tests are green. |
+| **Week 3** ✅ | Recurring (+ walk-through tests T-R1…T-R5), utilization (incl. clock-change weeks), `GET /courts`, draft LIMITATIONS.md. | Brief's feature list complete. **Done.** |
+| **Week 4** | Series cancel, load check against NFR-1, stateful property test, LIMITATIONS.md final, walkthrough rehearsal (TRD §14). | — |
 
 ### Costs of the decisions (stated, not hidden)
 

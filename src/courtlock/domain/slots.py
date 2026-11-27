@@ -46,3 +46,33 @@ def validate_slot(venue: VenueConfig, start_at: datetime, now: datetime, horizon
         raise InvalidSlot(
             "start_at must be on the hour in the venue's local time and inside opening hours"
         )
+
+
+def series_occurrences(venue: VenueConfig, first_start_at: datetime, weeks: int) -> list[datetime]:
+    """UTC starts of a weekly series: the same venue-local wall-clock time every 7 days (BR-16).
+
+    A game at 10:00 stays at 10:00 across a clock change. If the wall-clock time does not exist
+    on one of the days (spring-forward gap) the series cannot be created as asked.
+    """
+    zone = ZoneInfo(venue.timezone)
+    first_local = first_start_at.astimezone(zone).replace(tzinfo=None)
+    starts: list[datetime] = []
+    for week in range(weeks):
+        naive = first_local + timedelta(days=7 * week)
+        start_utc = naive.replace(tzinfo=zone).astimezone(UTC)
+        if start_utc.astimezone(zone).replace(tzinfo=None) != naive:
+            raise InvalidSlot(f"{naive:%Y-%m-%d %H:%M} does not exist in {venue.timezone}")
+        starts.append(start_utc)
+    return starts
+
+
+def validate_series(
+    venue: VenueConfig, first_start_at: datetime, weeks: int, now: datetime, horizon_days: int
+) -> list[datetime]:
+    """Every occurrence must be a real future slot. The horizon (BR-4) binds the FIRST one;
+    later weeks may extend up to `weeks` weeks beyond it."""
+    validate_slot(venue, first_start_at, now, horizon_days)
+    starts = series_occurrences(venue, first_start_at, weeks)
+    for start in starts[1:]:
+        validate_slot(venue, start, now, horizon_days + 7 * weeks)
+    return starts

@@ -33,6 +33,11 @@ class CourtNotFound(CourtLockError):
     code = "court_not_found"
 
 
+class VenueNotFound(CourtLockError):
+    status_code = 404
+    code = "venue_not_found"
+
+
 class HoldNotFound(CourtLockError):
     status_code = 404
     code = "hold_not_found"
@@ -51,6 +56,11 @@ class SlotUnavailable(CourtLockError):
 class BookingLimitReached(CourtLockError):
     status_code = 409
     code = "booking_limit_reached"
+
+
+class SeriesConflict(CourtLockError):
+    status_code = 409
+    code = "series_conflict"
 
 
 class HoldExpired(CourtLockError):

@@ -83,6 +83,18 @@ class Member(Base):
     email: Mapped[str] = mapped_column(Text)
 
 
+class RecurringSeries(Base):
+    __tablename__ = "recurring_series"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True)
+    member_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("members.id"))
+    court_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("courts.id"))
+    weeks: Mapped[int] = mapped_column(SmallInteger)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("clock_timestamp()")
+    )
+
+
 class Booking(Base):
     """A hold is a booking in status HELD; the hold id is the booking id."""
 

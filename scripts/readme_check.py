@@ -1,9 +1,12 @@
 """Run the README's curl examples against a live stack, so the README cannot drift.
 
-Extracts the `bash` blocks from the variable set-up and from every numbered API section that
-is not marked "(week 3)", runs them in order in one shell, and checks the observable results.
+Extracts the `bash` blocks from the variable set-up and from every numbered API section
+(1-7), runs them in order in one shell, and checks the observable results.
 
-Needs: bash, curl, jq and a running stack (default http://localhost:8000).
+Needs: bash, curl, jq and a running stack (default http://localhost:8000). Section 5 books a
+12-week series on a fixed court and time, so run it against a fresh database
+(`docker compose down -v && docker compose up -d --wait`); a second run would see its own
+earlier series and report a conflict.
 Usage: python scripts/readme_check.py [--base-url URL]
 """
 
@@ -27,6 +30,10 @@ EXPECTED = (
     '"status": "CANCELLED"',  # section 4: cancel
     '"refund_percent": 100',  # section 4: >= 24 h notice
     '"refund_percent": 0',  # section 4: late cancellation
+    '"series_id"',  # section 5: the series was booked
+    '"code": "series_conflict"',  # section 5: a taken week refuses the whole series
+    '"utilization_pct"',  # section 6: utilization report
+    '"venue_name"',  # section 7: court listing
 )
 
 
@@ -37,15 +44,15 @@ def sections(text: str) -> list[tuple[str, str]]:
 
 
 def runnable_blocks(text: str) -> list[str]:
-    """Blocks of the set-up subsection and of API sections 1-4 (their subsections included)."""
+    """Blocks of the set-up subsection and of API sections 1-7 (their subsections included)."""
     blocks: list[str] = []
     parent = ""  # the most recent level-2 heading; level-3 headings inherit from it
     for heading, body in sections(text):
         if heading.startswith("## "):
             parent = heading
         is_setup = heading.startswith("### Set up variables")
-        is_core_api = re.match(r"## [1-4]\. ", parent) is not None
-        if (is_setup or is_core_api) and "(week 3)" not in parent:
+        is_api = re.match(r"## [1-7]\. ", parent) is not None
+        if is_setup or is_api:
             blocks.extend(BASH_BLOCK.findall(body))
     return blocks
 

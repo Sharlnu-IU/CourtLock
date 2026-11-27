@@ -97,6 +97,7 @@ def make_booking(
     start_at: datetime,
     status: str = "CONFIRMED",
     price: int = 1200,
+    band: str = "OFFPEAK",
     hold_expires_at: datetime | None = None,
     charged: bool = True,
 ) -> uuid.UUID:
@@ -106,9 +107,14 @@ def make_booking(
         conn.execute(
             text(
                 "INSERT INTO bookings (id, member_id, court_id, start_at, end_at, status, band,"
-                " price_cents, currency, hold_expires_at, confirmed_at)"
-                " VALUES (:id, :m, :c, :s, :e, CAST(:st AS booking_status), 'OFFPEAK', :p, 'USD',"
-                " :h, CASE WHEN :st = 'CONFIRMED' THEN clock_timestamp() END)"
+                " price_cents, currency, hold_expires_at, confirmed_at, cancelled_at,"
+                " refund_percent, refund_cents)"
+                " VALUES (:id, :m, :c, :s, :e, CAST(:st AS booking_status),"
+                " CAST(:band AS price_band), :p, 'USD', :h,"
+                " CASE WHEN :st = 'CONFIRMED' THEN clock_timestamp() END,"
+                " CASE WHEN :st = 'CANCELLED' THEN clock_timestamp() END,"
+                " CASE WHEN :st = 'CANCELLED' THEN 0 END,"
+                " CASE WHEN :st = 'CANCELLED' THEN 0 END)"
             ),
             {
                 "id": booking_id,
@@ -117,6 +123,7 @@ def make_booking(
                 "s": start_at,
                 "e": start_at + timedelta(hours=1),
                 "st": status,
+                "band": band,
                 "p": price,
                 "h": hold_expires_at,
             },
@@ -165,6 +172,32 @@ def ledger_count(engine: Engine, booking_id: uuid.UUID, kind: str) -> int:
         "SELECT count(*) FROM ledger_entries WHERE booking_id = :b AND kind = :k",
         b=booking_id,
         k=kind,
+    )
+
+
+def make_inactive_court(engine: Engine, venue_id: uuid.UUID) -> uuid.UUID:
+    court_id = make_court(engine, venue_id)
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE courts SET is_active = false WHERE id = :id"), {"id": court_id})
+    return court_id
+
+
+def series_integrity_violations(engine: Engine) -> int:
+    """Series that are neither absent nor complete: any partial series is a G3 failure."""
+    return count_rows(
+        engine,
+        "SELECT count(*) FROM recurring_series s WHERE s.weeks <>"
+        " (SELECT count(*) FROM bookings b WHERE b.series_id = s.id)",
+    )
+
+
+def overlapping_active_pairs(engine: Engine) -> int:
+    """Pairs of active rows on one court whose time ranges overlap: must always be zero (G1)."""
+    return count_rows(
+        engine,
+        "SELECT count(*) FROM bookings a JOIN bookings b"
+        " ON a.court_id = b.court_id AND a.id < b.id AND a.during && b.during"
+        " WHERE a.status IN ('HELD', 'CONFIRMED') AND b.status IN ('HELD', 'CONFIRMED')",
     )
 
 

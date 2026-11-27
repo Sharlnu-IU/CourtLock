@@ -38,5 +38,21 @@ class Api:
     def availability(self, court: uuid.UUID, **params: str) -> httpx.Response:
         return self.client.get(f"/courts/{court}/availability", params=params)
 
+    def series(
+        self, member: uuid.UUID, court: uuid.UUID, first_start_at: datetime, weeks: int
+    ) -> httpx.Response:
+        return self.client.post(
+            "/recurring-bookings",
+            headers={"X-Member-Id": str(member)},
+            json={"court_id": str(court), "first_start_at": iso(first_start_at), "weeks": weeks},
+        )
+
+    def utilization(self, key: str | None = "test-staff-key", **params: str) -> httpx.Response:
+        headers = {} if key is None else {"X-Staff-Key": key}
+        return self.client.get("/staff/utilization", headers=headers, params=params)
+
+    def courts(self) -> httpx.Response:
+        return self.client.get("/courts")
+
     def close(self) -> None:
         self.client.close()

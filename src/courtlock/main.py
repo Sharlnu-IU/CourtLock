@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from courtlock.api.errors import register_error_handlers
-from courtlock.api.routers import bookings, courts, holds
+from courtlock.api.routers import bookings, courts, holds, recurring, staff
 from courtlock.config import Settings, get_settings
 from courtlock.db.session import make_engine, make_session_factory
 
@@ -32,6 +32,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(holds.router)
     app.include_router(bookings.router)
     app.include_router(courts.router)
+    app.include_router(recurring.router)
+    app.include_router(staff.router)
 
     @app.get("/healthz", tags=["ops"])
     def healthz() -> dict[str, str]:

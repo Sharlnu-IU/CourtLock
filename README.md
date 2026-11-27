@@ -4,13 +4,13 @@
 
 A community club rents sports courts by the hour across a few venues. CourtLock lets members browse availability, hold a court briefly, confirm it, cancel it, and book it weekly. The database guarantees that no court is ever booked twice, retries never create duplicates, and a failed operation never leaves half-written state.
 
-> **Status: week 2 complete.** The four fixed endpoints (`POST /holds`, `POST /holds/{id}/confirm`, `POST /bookings/{id}/cancel`, `GET /courts/{id}/availability`) are implemented and run under `docker compose up`, with tests for all three guarantees. This README is the **API contract**: the endpoints behave *exactly* as shown here, and CI runs every `bash` block in sections 1-4 against the running stack, so this page cannot drift from the behaviour. Sections marked **(week 3)** (recurring bookings, staff utilization, court listing) are designed but **not built yet**.
+> **Status: week 3 complete.** Everything in the brief is implemented and runs under `docker compose up`: the four fixed endpoints (`POST /holds`, `POST /holds/{id}/confirm`, `POST /bookings/{id}/cancel`, `GET /courts/{id}/availability`), weekly recurring bookings, peak/off-peak pricing, the 3-booking cap and the 24 h refund rule, and weekly staff utilization, with tests for all three guarantees. This README is the **API contract**: the endpoints behave *exactly* as shown here, and CI runs every `bash` block in sections 1-7 against the running stack, so this page cannot drift from the behaviour. Still to come in week 4: cancelling a whole series in one call, load measurements, and the final `LIMITATIONS.md`.
 
 | Doc | Purpose |
 |---|---|
 | [DESIGN.md](DESIGN.md) | PRD: goals, business rules, scope cuts, assumptions, open questions, rejected alternatives, response to review |
 | [docs/TRD.md](docs/TRD.md) | Technical design: data model, how each guarantee is enforced and tested, CI |
-| `LIMITATIONS.md` | How the system can still fail (written at the end of the build) |
+| [LIMITATIONS.md](LIMITATIONS.md) | How the system can still fail (draft; finalized in week 4) |
 
 ## The three guarantees
 
@@ -249,18 +249,17 @@ curl -s -X POST "$BASE/bookings/$LATE/cancel" -H "X-Member-Id: $ALICE" | jq
 
 ---
 
-## 5. Weekly recurring booking — `POST /recurring-bookings` (week 3)
+## 5. Weekly recurring booking — `POST /recurring-bookings`
 
-Books the same **local** time every 7 days for 2–12 weeks, **all or nothing**: if any week is unavailable, nothing is booked. Charged up front, one charge per occurrence. The whole series counts as **one** booking toward the member's cap of 3. Each occurrence can be cancelled separately with `POST /bookings/{id}/cancel` (refund by the 24 h rule).
+Books the same **local** time every 7 days for 2–12 weeks, **all or nothing**: if any week is unavailable, nothing is booked and nothing is charged. Each occurrence is an ordinary confirmed booking, charged up front, so the response is final (there is no hold step). The whole series counts as **one** booking toward the member's cap of 3. The **first** slot must be within 90 days; later weeks may extend beyond that. Each week can be cancelled separately with `POST /bookings/{id}/cancel` (refund by the 24 h rule); the series stops counting toward the cap once its last live week is cancelled or past.
+
+Body: `court_id`, `first_start_at` (an on-the-hour slot, ISO-8601 with offset), `weeks` (2–12).
 
 ```bash
 CAROL=00000000-0000-4000-8000-0000000000a3
 COURT2=00000000-0000-4000-8000-0000000000c2
-FIRST=$(date -u -d '+10 days' +%Y-%m-%dT11:00:00Z)   # macOS: date -u -v+10d +%Y-%m-%dT11:00:00Z
-curl -s -X POST "$BASE/recurring-bookings" \
-  -H "Content-Type: application/json" \
-  -H "X-Member-Id: $CAROL" \
-  -d "{\"court_id\": \"$COURT2\", \"first_start_at\": \"$FIRST\", \"weeks\": 12}" | jq
+FIRST=$(date -u -d '+10 days' +%Y-%m-%dT11:00:00Z)   # macOS: gdate
+curl -s -X POST "$BASE/recurring-bookings"   -H "Content-Type: application/json"   -H "X-Member-Id: $CAROL"   -d "{\"court_id\": \"$COURT2\", \"first_start_at\": \"$FIRST\", \"weeks\": 12}" | jq
 ```
 
 `201 Created`
@@ -280,52 +279,92 @@ curl -s -X POST "$BASE/recurring-bookings" \
 }
 ```
 
-(`bookings` has one entry per week.)
+(`bookings` has one entry per week, in date order. Each week is priced by its own slot, so a series can mix peak and off-peak weeks.)
+
+If any week is taken, **nothing** is booked. Bob asks for the same weekly slot:
+
+```bash
+curl -s -X POST "$BASE/recurring-bookings"   -H "Content-Type: application/json"   -H "X-Member-Id: $BOB"   -d "{\"court_id\": \"$COURT2\", \"first_start_at\": \"$FIRST\", \"weeks\": 12}" | jq
+```
+
+`409 Conflict` — every unavailable week is listed. Holds that have expired are **not** conflicts, even if nothing has cleaned them up yet:
+
+```json
+{"type": "about:blank", "title": "Conflict", "status": 409, "code": "series_conflict",
+ "detail": "12 of 12 weeks are not available; nothing was booked",
+ "conflicts": [{"start_at": "2026-12-10T11:00:00Z"}, {"start_at": "2026-12-17T11:00:00Z"}, "… one entry per unavailable week (12 here)"]}
+```
 
 | Status | `code` | When |
 |---|---|---|
-| 409 | `series_conflict` | at least one week is taken. Body includes `"conflicts": [{"start_at": "…"}]` and **nothing was booked**. Expired, unswept holds do **not** count as conflicts |
+| 401 | `missing_identity` | no `X-Member-Id` |
+| 404 | `member_not_found`, `court_not_found` | unknown ids |
+| 409 | `series_conflict` | at least one week is taken (see `conflicts`), or a week was taken while booking. Nothing was booked |
 | 409 | `booking_limit_reached` | member already has 3 active future bookings/series |
-| 422 | `invalid_slot` | any occurrence not on a venue-local hour, outside opening hours, first slot in the past or > 90 days away; `weeks` outside 2–12 |
+| 422 | `invalid_slot` | any occurrence is not on a venue-local hour, is outside opening hours, falls on a local time that does not exist (clock change), or the first slot is in the past / more than 90 days away |
+| 422 | `validation_error` | malformed body, or `weeks` outside 2–12 |
 
-## 6. Weekly utilization (staff) — `GET /staff/utilization` (week 3)
+A retried request whose first response was lost conflicts with the member's own bookings and returns `series_conflict` (see LIMITATIONS.md).
 
-Query: `week` (ISO week, e.g. `2026-W48`, Monday–Sunday in each venue's local time), optional `venue_id`. Header `X-Staff-Key`. Utilization = confirmed booked hours ÷ bookable (opening) hours. Cancelled bookings and holds are not counted.
+## 6. Weekly utilization (staff) — `GET /staff/utilization`
+
+Query: `week` (required; ISO week such as `2026-W48`, Monday–Sunday in each **venue's local time**), optional `venue_id`. Header `X-Staff-Key`. For each active court: utilization = **confirmed** booked hours ÷ bookable (opening) hours. Cancelled bookings and holds are never counted. The peak/off-peak split uses the band locked when the slot was booked. In a week with a clock change, bookable hours count the slots that really exist.
 
 ```bash
-curl -s "$BASE/staff/utilization?week=2026-W48" -H "X-Staff-Key: $STAFF_KEY" | jq
+WEEK=$(date -u -d "$FIRST" +%G-W%V)                  # the ISO week of Carol's first game
+RIVERSIDE=00000000-0000-4000-8000-0000000000b1
+curl -s "$BASE/staff/utilization?week=$WEEK&venue_id=$RIVERSIDE" -H "X-Staff-Key: $STAFF_KEY" | jq
 ```
 
 `200 OK`
 
 ```json
 {
-  "week": "2026-W48",
-  "week_start": "2026-11-23",
-  "week_end": "2026-11-30",
+  "week": "2026-W50",
+  "week_start": "2026-12-07",
+  "week_end": "2026-12-14",
   "venues": [
     {"venue_id": "00000000-0000-4000-8000-0000000000b1", "name": "Riverside Sports Club",
-     "timezone": "UTC", "booked_hours": 31, "bookable_hours": 224, "utilization_pct": 13.8,
+     "timezone": "UTC", "booked_hours": 1, "bookable_hours": 224, "utilization_pct": 0.4,
      "courts": [
        {"court_id": "00000000-0000-4000-8000-0000000000c1", "name": "Court 1",
-        "booked_hours": 20, "bookable_hours": 112, "utilization_pct": 17.9,
-        "peak_hours": 9, "offpeak_hours": 11}
+        "booked_hours": 0, "bookable_hours": 112, "utilization_pct": 0.0,
+        "peak_hours": 0, "offpeak_hours": 0},
+       {"court_id": "00000000-0000-4000-8000-0000000000c2", "name": "Court 2",
+        "booked_hours": 1, "bookable_hours": 112, "utilization_pct": 0.9,
+        "peak_hours": 0, "offpeak_hours": 1}
      ]}
   ]
 }
 ```
 
-`week_end` is exclusive. Errors: `401 invalid_staff_key`, `422 validation_error`.
+`week_end` is exclusive; `utilization_pct` has one decimal. `venue_id` is optional: leave it out to list every venue (ordered by name).
 
-## 7. Browse courts — `GET /courts` (week 3, optional)
+| Status | `code` | When |
+|---|---|---|
+| 401 | `invalid_staff_key` | missing or wrong `X-Staff-Key` |
+| 404 | `venue_not_found` | `venue_id` does not exist |
+| 422 | `validation_error` | `week` missing, malformed, or not a real ISO week |
 
-No auth. Lists active courts so a client can discover ids.
+## 7. Browse courts — `GET /courts`
+
+No auth. Lists active courts (by venue, then court name) so a client can discover court ids.
 
 ```bash
 curl -s "$BASE/courts" | jq
 ```
 
-`200 OK`: `{"courts": [{"id": "…", "name": "Court 1", "sport": "tennis", "venue_id": "…", "venue_name": "Riverside Sports Club", "timezone": "UTC"}]}`
+`200 OK`
+
+```json
+{
+  "courts": [
+    {"id": "00000000-0000-4000-8000-0000000000c3", "name": "Court A", "sport": "basketball",
+     "venue_id": "00000000-0000-4000-8000-0000000000b2", "venue_name": "Hilltop Courts",
+     "timezone": "Asia/Kolkata"}
+  ]
+}
+```
 
 ---
 
@@ -334,7 +373,7 @@ curl -s "$BASE/courts" | jq
 | Status | Codes |
 |---|---|
 | 401 | `missing_identity`, `invalid_staff_key` |
-| 404 | `member_not_found`, `court_not_found`, `hold_not_found`, `booking_not_found` |
+| 404 | `member_not_found`, `court_not_found`, `venue_not_found`, `hold_not_found`, `booking_not_found` |
 | 409 | `slot_unavailable`, `booking_limit_reached`, `hold_expired`, `invalid_state`, `booking_started`, `series_conflict` |
 | 422 | `invalid_slot`, `validation_error` |
 | 500 | `internal_error` (never exposes SQL) |
